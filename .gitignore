@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+
+# Virtual environment
+venv/
+.venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Claude Code memory
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDEs
+.vscode/
+.idea/
+
+# Data (reproducible via: python pipeline.py)
+/data/
+*.csv
+
+# Reports (all generated outputs — regenerate with eda_plots.py / candlestick_interactive.py)
+reports/
+*.png
+*.html
+
+# LaTeX (thesis documents — not versioned here)
+*.tex
+*.aux
+*.log
+*.out
+*.toc
+*.synctex.gz
