@@ -3,7 +3,7 @@ Bitcoin Forecasting — Pipeline Orchestrator
 
 Runs the full data preparation pipeline end to end:
   1. ingest   -- download raw data from Yahoo Finance
-  2. features -- build ARIMA / XGBoost / LSTM feature datasets
+  2. features -- build ARIMA / Prophet / XGBoost / LSTM feature datasets
 
 Usage:
   python pipeline.py                  # full pipeline
@@ -13,9 +13,7 @@ Usage:
   python pipeline.py --only-features  # only build features
 """
 import argparse
-import sys
 import time
-from pathlib import Path
 
 # ---------------------------------------------------------------------------
 # Helpers

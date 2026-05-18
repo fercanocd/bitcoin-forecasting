@@ -5,8 +5,8 @@ Reads  : data/processed/lstm_features_daily.csv
 Outputs: walk-forward one-step-ahead predictions (log-return)
 
 Architecture  : multi-layer LSTM → Linear(hidden, 1)
-Features (19) : log_return, Close/SMA×4, Close/EMA×2, RSI-14 [0,1],
-                bb_width, atr_norm, log_volume_ratio,
+Features (19) : log_return, log(P/SMA)×3, log(P/EMA)×2, MACD,
+                RSI-14 [0,1], log_bb_width, log_atr_norm, log_volume_ratio,
                 calendar×4, macro_return×4
 Preprocessing : StandardScaler fitted on training window only (no leakage)
                 Applied per walk-forward step

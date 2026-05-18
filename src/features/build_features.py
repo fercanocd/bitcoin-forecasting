@@ -1,11 +1,12 @@
 """
 Feature engineering for Bitcoin price forecasting.
 
-Generates three dataset families in data/processed/:
+Generates four dataset families in data/processed/:
 
   ARIMA/SARIMA/SARIMAX  ->  arima_features_daily.csv
   XGBoost               ->  xgboost_features_daily.csv
   LSTM                  ->  lstm_features_daily.csv
+  Prophet               ->  prophet_features_daily.csv
 
 Source data:
   data/raw/btc_ohlcv.csv  -- BTC daily OHLCV
@@ -17,7 +18,6 @@ Usage:
 import pandas as pd
 import numpy as np
 import ta
-import pathlib
 from pathlib import Path
 
 RAW_DIR       = Path(__file__).resolve().parents[2] / "data" / "raw"
@@ -34,10 +34,21 @@ def load_btc(path: Path = None) -> pd.DataFrame:
     return df
 
 
-def load_macro(path: pathlib.Path = None) -> pd.DataFrame:
+def load_macro(path: Path = None) -> pd.DataFrame:
+    """Load macro raw CSV with prices forward-filled on weekends/holidays.
+
+    SP500, Gold and DXY trade only on business days; ETH trades 24/7. The
+    raw CSV uses the union of all indices, leaving NaN on weekends for the
+    closed markets. Forward-filling the prices preserves the last known
+    market state, so any derived feature (log-returns, ratios, ...) computed
+    on top inherits the correct interpretation: weekends produce zero
+    returns (no new information), and Mondays carry the real Fri-to-Mon
+    price change.
+    """
     path = path or RAW_DIR / "macro_raw.csv"
     df = pd.read_csv(path, index_col="Date", parse_dates=True)
     df.index = pd.to_datetime(df.index).tz_localize(None)
+    df = df.ffill()
     return df
 
 
@@ -59,27 +70,28 @@ def _get_macro_log_returns() -> pd.DataFrame:
     return macro
 
 
-def _get_macro_full() -> pd.DataFrame:
-    raw = load_macro()
-    macro = pd.DataFrame(index=raw.index)
-    for name in ["sp500", "gold", "dxy", "eth"]:
-        col = f"{name}_close"
-        if col in raw.columns:
-            macro[col]                  = raw[col]
-            macro[f"{name}_log_return"] = np.log(raw[col] / raw[col].shift(1))
-    return macro
-
-
 def _join_macro(df: pd.DataFrame, macro: pd.DataFrame) -> pd.DataFrame:
-    """Left-join macro onto BTC df, forward-filling weekends/holidays."""
+    """Left-join macro onto BTC df.
+
+    Macro prices are already forward-filled in load_macro(), so the ffill
+    here is a defensive fallback for any residual gaps that could appear
+    after the join (e.g. dates present in the BTC index but absent from
+    the macro index).
+    """
     df = df.join(macro, how="left")
     df[macro.columns] = df[macro.columns].ffill()
     return df
 
 
-def _drop_warmup(df: pd.DataFrame, target_col: str = "target_return") -> pd.DataFrame:
-    """Drop NaN rows from indicator warm-up, preserving target_col NaN on last row."""
-    feature_cols = [c for c in df.columns if c != target_col]
+def _drop_warmup(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop NaN rows from indicator warm-up.
+
+    All columns starting with 'target_' are treated as forecasting targets
+    and excluded from the NaN check: their NaNs at the end of the sample
+    (where the future is unknown) are expected and must be preserved.
+    """
+    target_cols  = [c for c in df.columns if c.startswith("target_")]
+    feature_cols = [c for c in df.columns if c not in target_cols]
     before = len(df)
     df = df.dropna(subset=feature_cols)
     print(f"  Dropped {before - len(df)} warm-up rows -> {len(df)} rows remaining")
@@ -103,7 +115,8 @@ def build_arima(save: bool = True) -> pd.DataFrame:
 
     Endogenous series : log_return  -- log(Pt / Pt-1), stationary by construction.
     Exogenous regressors: log_volume_ratio, macro log-returns (SARIMAX only).
-    Target            : target_return = log_return.shift(-1)  -- next-day log-return.
+    Targets           : target_log_return_{1d, 7d, 30d}  -- h-step-ahead
+                        cumulative log-returns ln(P_{t+h} / P_t).
 
     No technical indicators: AR/MA terms capture autocorrelation internally.
     No price levels: log-returns are already stationary; no differencing needed.
@@ -123,7 +136,11 @@ def build_arima(save: bool = True) -> pd.DataFrame:
     macro = _get_macro_log_returns()
     out = _join_macro(out, macro)
 
-    out["target_return"] = out["log_return"].shift(-1)
+    # Targets — h-step-ahead cumulative log-returns ln(P_{t+h}/P_t).
+    # h in {1, 7, 30} calendar days (BTC trades 24/7/365).
+    out["target_log_return_1d"]  = np.log(c.shift(-1)  / c)
+    out["target_log_return_7d"]  = np.log(c.shift(-7)  / c)
+    out["target_log_return_30d"] = np.log(c.shift(-30) / c)
     out = _drop_warmup(out)
 
     print(f"  Shape: {out.shape}  |  Columns: {list(out.columns)}")
@@ -137,10 +154,13 @@ def build_arima(save: bool = True) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def build_xgboost(save: bool = True) -> pd.DataFrame:
-    """Build full feature set for XGBoost (no normalisation needed for trees).
+    """Build feature set for XGBoost using scale-invariant transformations.
 
-    Includes price, trend, momentum, volatility, volume, lags, calendar,
-    macro and target_return.
+    Trees are invariant to monotonic transformations but sensitive to the
+    absolute scale of inputs when train and test span very different price
+    regimes. The feature set therefore uses log close-to-MA ratios and a
+    normalised MACD instead of raw prices and absolute moving averages,
+    and macro variables enter only as log-returns (not as price levels).
     """
     print("\n[XGBoost] Building daily features...")
     df = load_btc()
@@ -150,34 +170,40 @@ def build_xgboost(save: bool = True) -> pd.DataFrame:
 
     out = pd.DataFrame(index=df.index)
 
-    # Price
-    out["Close"]      = c
+    # Return (1)
     out["log_return"] = np.log(c / c.shift(1))
 
-    # Trend (6)
-    out["sma_7"]   = ta.trend.sma_indicator(c, window=7)
-    out["sma_21"]  = ta.trend.sma_indicator(c, window=21)
-    out["sma_50"]  = ta.trend.sma_indicator(c, window=50)
-    out["sma_200"] = ta.trend.sma_indicator(c, window=200)
-    out["ema_12"]  = ta.trend.ema_indicator(c, window=12)
-    out["ema_26"]  = ta.trend.ema_indicator(c, window=26)
+    # Trend — log close-to-SMA (3) + log close-to-EMA (2) + MACD (1)
+    # EMAs computed once and reused for both log-ratios and MACD.
+    ema_12 = ta.trend.ema_indicator(c, window=12)
+    ema_26 = ta.trend.ema_indicator(c, window=26)
+    for n in [21, 50, 200]:
+        out[f"log_close_sma_{n}"] = np.log(c / ta.trend.sma_indicator(c, window=n))
+    out["log_close_ema_12"] = np.log(c / ema_12)
+    out["log_close_ema_26"] = np.log(c / ema_26)
+    out["macd"]             = (ema_12 - ema_26) / c
 
-    # Momentum (1) — RSI normalised to [0, 1]
+    # Momentum (1) — RSI bounded in [0, 1]
     out["rsi_14"] = ta.momentum.rsi(c, window=14) / 100
 
-    # Volatility (2) — bb_width computed directly; band levels removed (co-move with SMAs)
-    sma_20          = ta.trend.sma_indicator(c, window=20)
-    std_20          = c.rolling(20).std()
-    out["bb_width"] = (4 * std_20) / sma_20
-    out["atr_14"]   = ta.volatility.average_true_range(h, l, c, window=14)
+    # Volatility (2) — log of dispersion ratios for symmetric, scale-invariant
+    # distribution. bb_width = 4*sigma_20/SMA_20 and atr_norm = ATR_14/P_t are
+    # kept as intermediate variables only; the log-versions are the features.
+    eps                 = 1e-8
+    sma_20              = ta.trend.sma_indicator(c, window=20)
+    std_20              = c.rolling(20).std()
+    bb_width            = (4 * std_20) / sma_20
+    atr_norm            = ta.volatility.average_true_range(h, l, c, window=14) / c
+    out["log_bb_width"] = np.log(np.maximum(bb_width, eps))
+    out["log_atr_norm"] = np.log(np.maximum(atr_norm, eps))
 
-    # Volume (1) — OBV removed (numerically unstable ratio)
+    # Volume (1)
     volume_sma_20           = ta.trend.sma_indicator(v, window=20)
     out["log_volume_ratio"] = np.log(v / volume_sma_20)
 
     # Lags — log-return lagged, capturing return autocorrelation directly
     for lag in [1, 2, 3, 5, 7, 14, 21]:
-        out[f"return_lag_{lag}"] = out["log_return"].shift(lag)
+        out[f"log_return_lag_{lag}"] = out["log_return"].shift(lag)
 
     # Calendar — cyclic sin/cos encoding to preserve wrap-around structure
     out["dow_sin"]   = np.sin(2 * np.pi * df.index.dayofweek / 7)
@@ -185,12 +211,16 @@ def build_xgboost(save: bool = True) -> pd.DataFrame:
     out["month_sin"] = np.sin(2 * np.pi * df.index.month / 12)
     out["month_cos"] = np.cos(2 * np.pi * df.index.month / 12)
 
-    # Macro — close prices + returns
-    print("  Joining macro data...")
-    macro = _get_macro_full()
+    # Macro — log-returns only (raw closes dropped: non-stationary across windows)
+    print("  Joining macro log-returns...")
+    macro = _get_macro_log_returns()
     out = _join_macro(out, macro)
 
-    out["target_return"] = out["log_return"].shift(-1)
+    # Targets — h-step-ahead cumulative log-returns ln(P_{t+h}/P_t).
+    # h in {1, 7, 30} calendar days (BTC trades 24/7/365).
+    out["target_log_return_1d"]  = np.log(c.shift(-1)  / c)
+    out["target_log_return_7d"]  = np.log(c.shift(-7)  / c)
+    out["target_log_return_30d"] = np.log(c.shift(-30) / c)
     out = _drop_warmup(out)
 
     print(f"  Shape: {out.shape}  |  {out.shape[1]} features")
@@ -204,14 +234,17 @@ def build_xgboost(save: bool = True) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 
 def build_lstm(save: bool = True) -> pd.DataFrame:
-    """Build curated, pre-normalised feature set for LSTM models.
+    """Build pre-normalised feature set for LSTM models.
 
     Design principles:
     - No lags (replaced by the LSTM sequence window)
-    - Trend as scale-invariant ratios (Close / SMA)
-    - Calendar normalised to [0, 1]
+    - Trend as scale-invariant log close-to-MA ratios + normalised MACD
     - One representative per indicator family
     - Macro returns only, no absolute prices
+
+    Trend representation matches the XGBoost feature set, so any
+    performance difference between the two reflects model architecture
+    rather than feature scaling.
     """
     print("\n[LSTM] Building daily features...")
     df = load_btc()
@@ -224,22 +257,30 @@ def build_lstm(save: bool = True) -> pd.DataFrame:
     # Return (1)
     out["log_return"] = np.log(c / c.shift(1))
 
-    # Trend — scale-invariant Close/SMA ratios (4) and Close/EMA ratios (2)
-    for n in [7, 21, 50, 200]:
-        out[f"close_to_sma{n}"] = c / ta.trend.sma_indicator(c, window=n)
-    for n in [12, 26]:
-        out[f"close_to_ema{n}"] = c / ta.trend.ema_indicator(c, window=n)
+    # Trend — log close-to-SMA (3) + log close-to-EMA (2) + MACD (1)
+    # EMAs computed once and reused for both log-ratios and MACD.
+    ema_12 = ta.trend.ema_indicator(c, window=12)
+    ema_26 = ta.trend.ema_indicator(c, window=26)
+    for n in [21, 50, 200]:
+        out[f"log_close_sma_{n}"] = np.log(c / ta.trend.sma_indicator(c, window=n))
+    out["log_close_ema_12"] = np.log(c / ema_12)
+    out["log_close_ema_26"] = np.log(c / ema_26)
+    out["macd"]             = (ema_12 - ema_26) / c
 
-    # Momentum (1) — RSI normalised to [0, 1]
+    # Momentum (1) — RSI bounded in [0, 1]
     out["rsi_14"] = ta.momentum.rsi(c, window=14) / 100
 
-    # Volatility (2)
-    sma_20          = ta.trend.sma_indicator(c, window=20)
-    std_20          = c.rolling(20).std()
-    out["bb_width"] = (4 * std_20) / sma_20
-    out["atr_norm"] = ta.volatility.average_true_range(h, l, c, window=14) / c
+    # Volatility (2) — log of dispersion ratios; bb_width and atr_norm kept
+    # as intermediate variables only.
+    eps                 = 1e-8
+    sma_20              = ta.trend.sma_indicator(c, window=20)
+    std_20              = c.rolling(20).std()
+    bb_width            = (4 * std_20) / sma_20
+    atr_norm            = ta.volatility.average_true_range(h, l, c, window=14) / c
+    out["log_bb_width"] = np.log(np.maximum(bb_width, eps))
+    out["log_atr_norm"] = np.log(np.maximum(atr_norm, eps))
 
-    # Volume (1) — OBV removed (numerically unstable ratio)
+    # Volume (1)
     volume_sma_20           = ta.trend.sma_indicator(v, window=20)
     out["log_volume_ratio"] = np.log(v / volume_sma_20)
 
@@ -254,7 +295,11 @@ def build_lstm(save: bool = True) -> pd.DataFrame:
     macro = _get_macro_log_returns()
     out = _join_macro(out, macro)
 
-    out["target_return"] = out["log_return"].shift(-1)
+    # Targets — h-step-ahead cumulative log-returns ln(P_{t+h}/P_t).
+    # h in {1, 7, 30} calendar days (BTC trades 24/7/365).
+    out["target_log_return_1d"]  = np.log(c.shift(-1)  / c)
+    out["target_log_return_7d"]  = np.log(c.shift(-7)  / c)
+    out["target_log_return_30d"] = np.log(c.shift(-30) / c)
     out = _drop_warmup(out)
 
     print(f"  Shape: {out.shape}  |  {out.shape[1]} features")
@@ -264,11 +309,62 @@ def build_lstm(save: bool = True) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
+# Dataset 4: Prophet
+# ---------------------------------------------------------------------------
+
+def build_prophet(save: bool = True) -> pd.DataFrame:
+    """Build minimal feature set for Prophet (Meta).
+
+    Endogenous series : log_return  -- log(Pt / Pt-1); fed to Prophet as `y`
+                        after renaming Date -> ds in the model layer.
+    Regressors        : log_volume_ratio + macro log-returns, attached via
+                        Prophet's add_regressor (additive).
+    Targets           : target_log_return_{1d, 7d, 30d}  -- h-step-ahead
+                        cumulative log-returns ln(P_{t+h} / P_t), same as
+                        the other families for direct metric comparability.
+
+    Design choices (mirrors SARIMAX feature set):
+      - No technical indicators: Prophet decomposes trend, seasonality and
+        changepoints internally; SMAs/EMAs would duplicate that signal.
+      - No price level: Prophet operates directly on the log-return series.
+      - Same regressors as SARIMAX so any performance gap reflects model
+        architecture (structural decomposition + changepoints) rather than
+        feature access.
+    """
+    print("\n[Prophet] Building daily features...")
+    df = load_btc()
+    print(f"  Loaded {len(df)} rows")
+
+    c, v = df["Close"], df["Volume"]
+
+    out = pd.DataFrame(index=df.index)
+    out["log_return"]       = np.log(c / c.shift(1))
+    volume_sma_20           = ta.trend.sma_indicator(v, window=20)
+    out["log_volume_ratio"] = np.log(v / volume_sma_20)
+
+    print("  Joining macro log-returns...")
+    macro = _get_macro_log_returns()
+    out = _join_macro(out, macro)
+
+    # Targets — h-step-ahead cumulative log-returns ln(P_{t+h}/P_t).
+    # h in {1, 7, 30} calendar days (BTC trades 24/7/365).
+    out["target_log_return_1d"]  = np.log(c.shift(-1)  / c)
+    out["target_log_return_7d"]  = np.log(c.shift(-7)  / c)
+    out["target_log_return_30d"] = np.log(c.shift(-30) / c)
+    out = _drop_warmup(out)
+
+    print(f"  Shape: {out.shape}  |  Columns: {list(out.columns)}")
+    if save:
+        _save(out, "prophet_features_daily.csv")
+    return out
+
+
+# ---------------------------------------------------------------------------
 # build_all
 # ---------------------------------------------------------------------------
 
 def build_all(save: bool = True) -> dict:
-    """Run all three build pipelines and print a summary."""
+    """Run all four build pipelines and print a summary."""
     print(f"{'='*60}")
     print("Building all feature sets  |  freq=daily")
     print(f"{'='*60}")
@@ -276,6 +372,7 @@ def build_all(save: bool = True) -> dict:
         "arima":   build_arima(save=save),
         "xgboost": build_xgboost(save=save),
         "lstm":    build_lstm(save=save),
+        "prophet": build_prophet(save=save),
     }
     print(f"\n{'='*60}")
     print("Summary")
