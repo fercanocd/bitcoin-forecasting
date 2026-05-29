@@ -20,6 +20,8 @@ import numpy as np
 import ta
 from pathlib import Path
 
+from src.config import HORIZONS
+
 RAW_DIR       = Path(__file__).resolve().parents[2] / "data" / "raw"
 PROCESSED_DIR = Path(__file__).resolve().parents[2] / "data" / "processed"
 
@@ -137,10 +139,8 @@ def build_arima(save: bool = True) -> pd.DataFrame:
     out = _join_macro(out, macro)
 
     # Targets — h-step-ahead cumulative log-returns ln(P_{t+h}/P_t).
-    # h in {1, 7, 30} calendar days (BTC trades 24/7/365).
-    out["target_log_return_1d"]  = np.log(c.shift(-1)  / c)
-    out["target_log_return_7d"]  = np.log(c.shift(-7)  / c)
-    out["target_log_return_30d"] = np.log(c.shift(-30) / c)
+    for h in HORIZONS:
+        out[f"target_log_return_{h}d"] = np.log(c.shift(-h) / c)
     out = _drop_warmup(out)
 
     print(f"  Shape: {out.shape}  |  Columns: {list(out.columns)}")
@@ -217,10 +217,8 @@ def build_xgboost(save: bool = True) -> pd.DataFrame:
     out = _join_macro(out, macro)
 
     # Targets — h-step-ahead cumulative log-returns ln(P_{t+h}/P_t).
-    # h in {1, 7, 30} calendar days (BTC trades 24/7/365).
-    out["target_log_return_1d"]  = np.log(c.shift(-1)  / c)
-    out["target_log_return_7d"]  = np.log(c.shift(-7)  / c)
-    out["target_log_return_30d"] = np.log(c.shift(-30) / c)
+    for h in HORIZONS:
+        out[f"target_log_return_{h}d"] = np.log(c.shift(-h) / c)
     out = _drop_warmup(out)
 
     print(f"  Shape: {out.shape}  |  {out.shape[1]} features")
@@ -296,10 +294,8 @@ def build_lstm(save: bool = True) -> pd.DataFrame:
     out = _join_macro(out, macro)
 
     # Targets — h-step-ahead cumulative log-returns ln(P_{t+h}/P_t).
-    # h in {1, 7, 30} calendar days (BTC trades 24/7/365).
-    out["target_log_return_1d"]  = np.log(c.shift(-1)  / c)
-    out["target_log_return_7d"]  = np.log(c.shift(-7)  / c)
-    out["target_log_return_30d"] = np.log(c.shift(-30) / c)
+    for h in HORIZONS:
+        out[f"target_log_return_{h}d"] = np.log(c.shift(-h) / c)
     out = _drop_warmup(out)
 
     print(f"  Shape: {out.shape}  |  {out.shape[1]} features")
@@ -347,10 +343,8 @@ def build_prophet(save: bool = True) -> pd.DataFrame:
     out = _join_macro(out, macro)
 
     # Targets — h-step-ahead cumulative log-returns ln(P_{t+h}/P_t).
-    # h in {1, 7, 30} calendar days (BTC trades 24/7/365).
-    out["target_log_return_1d"]  = np.log(c.shift(-1)  / c)
-    out["target_log_return_7d"]  = np.log(c.shift(-7)  / c)
-    out["target_log_return_30d"] = np.log(c.shift(-30) / c)
+    for h in HORIZONS:
+        out[f"target_log_return_{h}d"] = np.log(c.shift(-h) / c)
     out = _drop_warmup(out)
 
     print(f"  Shape: {out.shape}  |  Columns: {list(out.columns)}")
