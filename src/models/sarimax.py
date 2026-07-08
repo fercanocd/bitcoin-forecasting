@@ -56,7 +56,9 @@ from statsmodels.tools.sm_exceptions import ConvergenceWarning
 
 from src.config import TEST_START, TEST_END, HORIZONS
 from src.evaluation.metrics import summary
-from src.evaluation.walk_forward import expanding_walk_forward
+from src.evaluation.walk_forward import (expanding_walk_forward,
+                                         expanding_walk_forward_multi_horizon,
+                                         month_start_positions)
 
 PROCESSED_DIR = Path(__file__).resolve().parents[2] / "data" / "processed"
 RESULTS_DIR   = Path(__file__).resolve().parents[2] / "reports" / "predictions"
@@ -218,27 +220,65 @@ def run(horizon=1, order=None, trend="c", keep_idx=None, select=True,
     return preds, m
 
 
-def run_all(horizons=None, trend="c", select=True, max_test_days=None):
-    """Run every horizon, selecting the daily order and regressors once.
+def run_all(horizons=None, trend="c", select=True, refit="step",
+            max_test_days=None):
+    """Run all horizons with a SINGLE walk-forward: one fit per origin, all horizons jointly.
 
-    The order and (optionally) the significant regressor subset are chosen once
-    on the initial training window and reused across horizons, so the daily
-    model is identical for every h -- only the number of summed steps differs.
+    This is the conceptually correct approach for a recursive model, and the
+    same one Prophet uses: the daily SARIMAX model is identical regardless of
+    the forecast horizon -- only the number of summed steps differs. Fitting
+    once per origin (instead of once per origin per horizon) cuts compute cost
+    by len(horizons)x with byte-identical results to running each horizon
+    separately. The order and significant regressor subset are still chosen
+    once on the initial training window and reused across horizons.
+
+    refit : "step" re-estimates every origin (matches the per-horizon default
+            and Prophet); "monthly" refits at each month start and relies on
+            SarimaxModel.observe's cheap Kalman filtering in between.
     """
     horizons = horizons or HORIZONS
-    data = load_data()
-    dates, endog, exog = data
-    test_start = int(dates.searchsorted(pd.Timestamp(TEST_START)))
-    y0, X0 = endog.to_numpy(float), exog.to_numpy(float)
-    order = select_order(y0[:test_start], X0[:test_start], trend=trend)
-    keep_idx = None
-    if select:
-        keep_idx = select_regressors(y0[:test_start], X0[:test_start], order,
-                                     EXOG_COLS, trend=trend)
+    print(f"\n[SARIMAX] multi-horizon walk-forward "
+          f"(trend={trend}, refit={refit}, horizons={horizons}, lag-1 exogenous)")
 
-    results = {h: run(horizon=h, order=order, trend=trend, keep_idx=keep_idx,
-                      select=select, max_test_days=max_test_days, _data=data)[1]
-               for h in horizons}
+    dates, endog, exog = load_data()
+    y = endog.to_numpy(dtype=float)
+    X = exog.to_numpy(dtype=float)
+
+    test_start = int(dates.searchsorted(pd.Timestamp(TEST_START)))
+    test_end   = len(y)
+    if TEST_END is not None:
+        test_end = int(dates.searchsorted(pd.Timestamp(TEST_END), side="right"))
+    if max_test_days is not None:
+        test_end = min(test_end, test_start + max_test_days)
+
+    print(f"  Train: {dates[0].date()} .. {dates[test_start-1].date()}  ({test_start} obs)")
+    print(f"  Test : {dates[test_start].date()} .. {dates[test_end-1].date()}  ({test_end-test_start} obs)")
+
+    order = select_order(y[:test_start], X[:test_start], trend=trend)
+    if select:
+        keep_idx = select_regressors(y[:test_start], X[:test_start], order,
+                                     EXOG_COLS, trend=trend)
+        X = X[:, keep_idx] if keep_idx else None
+
+    model = SarimaxModel(order=order, trend=trend)
+    refit_positions = (set(range(test_start, test_end)) if refit == "step"
+                       else month_start_positions(dates, test_start, test_end))
+
+    all_preds = expanding_walk_forward_multi_horizon(
+        y, X, dates, test_start, model, refit_positions,
+        horizons=horizons, test_end=test_end,
+    )
+
+    train_drift = float(y[:test_start].mean())
+    results = {}
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    for h, preds in all_preds.items():
+        m = summary(preds["y_true"].to_numpy(), preds["y_pred"].to_numpy(),
+                    drift=train_drift, horizon=h)
+        results[h] = m
+        out = RESULTS_DIR / f"sarimax_{h}d.csv"
+        preds.to_csv(out)
+        print(f"  Saved -> {out}")
 
     print(f"\n{'='*64}\n  SARIMAX summary  (RMSE / MAE / DA  vs predict-zero RMSE)\n{'='*64}")
     for h, m in results.items():
@@ -257,9 +297,11 @@ if __name__ == "__main__":
                     help="limit the test horizon for a quick smoke run")
     ap.add_argument("--no-select", action="store_true",
                     help="keep all exogenous regressors (skip significance selection)")
+    ap.add_argument("--refit", choices=["step", "monthly"], default="step",
+                    help="refit every origin (step, default) or monthly (dev)")
     args = ap.parse_args()
     select = not args.no_select
     if args.horizon is None:
-        run_all(select=select, max_test_days=args.max_test_days)
+        run_all(select=select, refit=args.refit, max_test_days=args.max_test_days)
     else:
         run(horizon=args.horizon, select=select, max_test_days=args.max_test_days)
