@@ -1,16 +1,20 @@
 """
 Bitcoin Forecasting — Pipeline Orchestrator
 
-Runs the full data preparation pipeline end to end:
+Runs the full pipeline end to end:
   1. ingest   -- download raw data from Yahoo Finance
   2. features -- build ARIMA / Prophet / XGBoost / LSTM feature datasets
+  3. models   -- walk-forward forecasts for the implemented models
+                 (SARIMAX, Prophet; XGBoost and LSTM are not yet implemented)
 
 Usage:
-  python pipeline.py                  # full pipeline
+  python pipeline.py                  # full pipeline (ingest + features + models)
   python pipeline.py --skip-ingest    # skip download (use existing raw CSVs)
   python pipeline.py --skip-features  # skip feature engineering
+  python pipeline.py --skip-models    # skip model runs
   python pipeline.py --only-ingest    # only download raw data
   python pipeline.py --only-features  # only build features
+  python pipeline.py --only-models    # only run the models
 """
 import argparse
 import time
@@ -47,6 +51,21 @@ def run_features():
     build_all()
 
 
+def run_models():
+    """Walk-forward runs for the implemented models. XGBoost and LSTM are still
+    stubs (see src/models/), so they are announced and skipped rather than
+    failing the pipeline."""
+    from src.models import sarimax, prophet_model
+
+    _header("SARIMAX (reduced, walk-forward)")
+    sarimax.run_all()
+
+    _header("Prophet (flat trend, walk-forward)")
+    prophet_model.run_all()
+
+    print("\n  XGBoost and LSTM are not yet implemented -- skipped.")
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -56,9 +75,11 @@ def parse_args():
     skip = p.add_argument_group("skip steps")
     skip.add_argument("--skip-ingest",   action="store_true", help="skip data download")
     skip.add_argument("--skip-features", action="store_true", help="skip feature engineering")
+    skip.add_argument("--skip-models",   action="store_true", help="skip model runs")
     only = p.add_argument_group("run only one step")
     only.add_argument("--only-ingest",   action="store_true", help="only run data download")
     only.add_argument("--only-features", action="store_true", help="only run feature engineering")
+    only.add_argument("--only-models",   action="store_true", help="only run the models")
     return p.parse_args()
 
 
@@ -72,12 +93,16 @@ def main():
     if args.only_features:
         _step("Step 1/1 — Feature engineering", run_features)
         return
+    if args.only_models:
+        _step("Step 1/1 — Models", run_models)
+        return
 
     # Full pipeline with optional skips
     t_start = time.time()
     steps = [
-        (not args.skip_ingest,   "Step 1/2 — Ingestion",           run_ingest),
-        (not args.skip_features, "Step 2/2 — Feature engineering",  run_features),
+        (not args.skip_ingest,   "Step 1/3 — Ingestion",           run_ingest),
+        (not args.skip_features, "Step 2/3 — Feature engineering",  run_features),
+        (not args.skip_models,   "Step 3/3 — Models",              run_models),
     ]
 
     active = [(label, fn) for enabled, label, fn in steps if enabled]

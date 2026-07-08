@@ -1,30 +1,283 @@
 """
-Prophet (Meta) walk-forward forecasting for Bitcoin log-returns.
+Prophet (Meta) walk-forward forecasting for Bitcoin log-returns (multi-horizon).
 
 Reads  : data/processed/prophet_features_daily.csv
-Outputs: walk-forward one-step-ahead predictions (log-return)
+Outputs: reports/predictions/prophet_{h}d.csv  (date, y_true, y_pred)
 
-Model family  : Prophet (additive structural model: trend + seasonality +
-                changepoints + regressors)
-Target (`y`)  : log_return  (log(Pt / Pt-1) on day t)
-Regressors    : log_volume_ratio, sp500_log_return, gold_log_return,
-                dxy_log_return, eth_log_return  (attached via add_regressor)
+Model family  : Prophet -- additive structural model (trend + seasonality +
+                regressors). Paired with SARIMAX as the classical baseline.
+Endogenous    : log_return  -- daily log(P_t / P_{t-1}); fed to Prophet as `y`.
+Regressors    : log_volume_ratio, sp500/gold/dxy/eth log-returns, attached via
+                add_regressor (additive mode). Same set as SARIMAX, so any gap
+                reflects model architecture, not feature access.
+Strategy      : recursive multi-step. The daily model is identical across
+                horizons; an h-day forecast is the sum of h forecast daily
+                log-returns (logs are additive: sum == ln(P_{t+h}/P_t)).
 
-Configuration :
-    seasonality_mode       = "additive"     # log-returns are unbounded & ~zero-centered
-    yearly_seasonality     = True           # macro / halving cycles
-    weekly_seasonality     = True           # potential weekend effects in crypto
-    daily_seasonality      = False          # data is already daily
-    changepoint_prior_scale = 0.05          # Prophet default
+Trend         : growth='flat' -- a constant level, the Prophet analog of
+                SARIMAX's trend='c' constant drift. log_return is ~zero-mean, so
+                a piecewise-linear trend would chase noise; a flat level plus
+                seasonality and regressors isolates whether Prophet's structural
+                decomposition adds anything over the pure drift. Any directional
+                gain still reflects that drift, so DA is read against an
+                "always predict up" reference, not 0.5.
 
-Validation    : expanding-window walk-forward, refit at every step.
-                At step t, train on rows up to and including t and forecast
-                r_{t+1}. Because Prophet needs regressor values at the
-                forecast horizon, the last observed regressor row (day t) is
-                carried forward to the t+1 future frame -- consistent with
-                the information set available at prediction time.
+Exogenous handling -- LAGGED by one day (lag-1), identical to SARIMAX.
+    The regressors are stochastic: their value on the forecast day is unknown
+    at prediction time. We use the previous day's regressor row, so the FIRST
+    future step is fed real, known values and the regressor block contributes.
+    For steps 2..h (h > 1) the regressors are genuinely unknown future returns
+    and are set to 0 -- the honest assumption for a zero-mean series. We never
+    read the lagged array beyond the first step, which would leak future macro
+    not known at the origin.
+
+Validation    : expanding-window walk-forward, REFIT AT EVERY ORIGIN. Unlike
+    SARIMAX -- whose state-space form filters each realised observation in
+    cheaply (append, refit=False) between monthly refits -- Prophet has no
+    cheap update: new data can only enter by re-estimating. Refitting every
+    step is therefore what makes Prophet a fair, apples-to-apples comparison to
+    SARIMAX (both always condition on the full realised history). A monthly
+    schedule is available via --refit for fast dev runs, but between refits it
+    ignores the most recent realised returns and is not directly comparable.
+    The last h origins are not scored (no realised h-day target yet).
 
 Usage:
-    python -m src.models.prophet_model
+    python -m src.models.prophet_model                      # all horizons
+    python -m src.models.prophet_model --horizon 7          # a single horizon
+    python -m src.models.prophet_model --refit monthly --max-test-days 60  # smoke
 """
-# TODO: implement walk-forward Prophet
+from __future__ import annotations
+import logging
+import warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+from prophet import Prophet
+
+from src.config import TEST_START, TEST_END, HORIZONS
+from src.evaluation.metrics import summary
+from src.evaluation.walk_forward import (expanding_walk_forward,
+                                         expanding_walk_forward_multi_horizon,
+                                         month_start_positions)
+
+PROCESSED_DIR = Path(__file__).resolve().parents[2] / "data" / "processed"
+RESULTS_DIR   = Path(__file__).resolve().parents[2] / "reports" / "predictions"
+
+ENDOG_COL      = "log_return"
+REGRESSOR_COLS = ["log_volume_ratio", "sp500_log_return", "gold_log_return",
+                  "dxy_log_return", "eth_log_return"]
+
+# Prophet/cmdstanpy re-add handlers at runtime; disabled=True is the only
+# reliable way to silence them completely.
+for _name in ("prophet", "cmdstanpy", "stan"):
+    logging.getLogger(_name).disabled = True
+warnings.simplefilter("ignore", FutureWarning)
+
+
+def load_data():
+    """Load the Prophet feature set and build the lag-1 regressor design.
+
+    Mirrors SARIMAX.load_data exactly: regressors are shifted by one day, so the
+    row aligned to prediction position i holds day i-1's values -- the macro
+    known when forecasting day i. The leading NaN row from the shift is dropped.
+    Returns (dates, endog Series, exog DataFrame) all aligned.
+    """
+    df = pd.read_csv(PROCESSED_DIR / "prophet_features_daily.csv",
+                     index_col="Date", parse_dates=True)
+    endog = df[ENDOG_COL]
+    exog  = df[REGRESSOR_COLS].shift(1)       # lag-1: known at forecast time
+    valid = exog.dropna().index               # drop the leading NaN row
+    return valid, endog.loc[valid], exog.loc[valid]
+
+
+class ProphetModel:
+    """Recursive multi-step Prophet wrapped for the walk-forward engine.
+
+    Prophet needs a `ds` datetime column, but the engine works positionally and
+    passes plain arrays. We therefore hand the model the full aligned date index
+    at construction and slice it by training length: after fit(y[:i]) the model
+    knows it was trained through position i-1 and forecasts the next h dates.
+
+    observe() only advances a position counter -- there is no cheap state to
+    filter, so the fair schedule refits every step (see run()). The counter also
+    lets the optional monthly schedule forecast from the correct origin between
+    refits (predicting farther ahead from the last fitted model).
+    """
+
+    def __init__(self, dates, regressors, growth="flat",
+                 seasonality_mode="additive", yearly=True, weekly=True,
+                 daily=False, changepoint_prior_scale=0.05):
+        self._dates = pd.DatetimeIndex(dates)
+        self._regressors = list(regressors)
+        self._kw = dict(
+            growth=growth,
+            seasonality_mode=seasonality_mode,
+            yearly_seasonality=yearly,
+            weekly_seasonality=weekly,
+            daily_seasonality=daily,
+            changepoint_prior_scale=changepoint_prior_scale,
+            uncertainty_samples=0,            # point forecast only -> much faster
+        )
+        self.m = None
+        self._n_train = 0                     # rows seen at last fit == origin pos
+        self._n_seen = 0                      # observes since last fit (monthly)
+
+    def _new_model(self) -> Prophet:
+        m = Prophet(**self._kw)
+        for col in self._regressors:
+            m.add_regressor(col)              # additive, standardised (auto)
+        return m
+
+    def fit(self, y_hist, X_hist):
+        n = len(y_hist)
+        train = pd.DataFrame({"ds": self._dates[:n],
+                              "y": np.asarray(y_hist, dtype=float)})
+        if X_hist is not None:
+            for j, col in enumerate(self._regressors):
+                train[col] = np.asarray(X_hist, dtype=float)[:, j]
+        self.m = self._new_model()
+        self.m.fit(train)
+        self._n_train = n
+        self._n_seen = 0
+
+    def forecast(self, horizon, X_next):
+        """h-step cumulative forecast: sum of the h forecast daily returns.
+
+        The origin is n_train + n_seen (advanced by observe when not refitting),
+        so the future frame uses the real calendar dates of the realised window
+        -- correct for the date-dependent weekly/yearly seasonality. With lag-1
+        regressors only the first future step's values are known (X_next); steps
+        2..h use 0 (unknown future zero-mean returns).
+        """
+        origin = self._n_train + self._n_seen
+        fut = pd.DataFrame({"ds": self._dates[origin:origin + horizon]})
+        reg = np.zeros((horizon, len(self._regressors)))
+        if X_next is not None:
+            reg[0] = np.asarray(X_next, dtype=float).ravel()
+        for j, col in enumerate(self._regressors):
+            fut[col] = reg[:, j]
+        yhat = self.m.predict(fut)["yhat"].to_numpy()
+        return float(yhat.sum())
+
+    def observe(self, y_obs, X_obs):
+        # No cheap state update in Prophet. Refit-every-step discards this; the
+        # counter only matters for the optional monthly schedule.
+        self._n_seen += 1
+
+
+def run(horizon=1, growth="flat", refit="step", max_test_days=None,
+        verbose=True, _data=None):
+    print(f"\n[Prophet] {horizon}-day-ahead walk-forward "
+          f"(growth={growth}, refit={refit}, lag-1 regressors)")
+    dates, endog, exog = _data if _data is not None else load_data()
+    y = endog.to_numpy(dtype=float)
+    X = exog.to_numpy(dtype=float)
+
+    test_start = int(dates.searchsorted(pd.Timestamp(TEST_START)))
+    test_end   = len(y)
+    if TEST_END is not None:
+        test_end = int(dates.searchsorted(pd.Timestamp(TEST_END), side="right"))
+    if max_test_days is not None:
+        test_end = min(test_end, test_start + max_test_days)
+
+    print(f"  Train: {dates[0].date()} .. {dates[test_start-1].date()}  ({test_start} obs)")
+    print(f"  Test : {dates[test_start].date()} .. {dates[test_end-1].date()}  ({test_end-test_start} obs)")
+
+    model = ProphetModel(dates, REGRESSOR_COLS, growth=growth)
+    if refit == "step":
+        refit_positions = set(range(test_start, test_end))   # every origin
+    else:
+        refit_positions = month_start_positions(dates, test_start, test_end)
+
+    preds = expanding_walk_forward(
+        y, X, dates, test_start, model, refit_positions,
+        horizon=horizon, test_end=test_end, verbose=verbose,
+    )
+
+    train_drift = float(y[:test_start].mean())
+    m = summary(preds["y_true"].to_numpy(), preds["y_pred"].to_numpy(),
+                drift=train_drift, horizon=horizon)
+    print(f"  Results: n={m['n']}  "
+          f"RMSE={m['rmse']:.5f} (zero {m['rmse_zero']:.5f}, drift {m['rmse_drift']:.5f})  "
+          f"MAE={m['mae']:.5f} (zero {m['mae_zero']:.5f}, drift {m['mae_drift']:.5f})  "
+          f"DA={m['da']:.3f} (up {m['da_up']:.3f}, edge {m['da_edge']:+.3f})")
+
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    out = RESULTS_DIR / f"prophet_{horizon}d.csv"
+    preds.to_csv(out)
+    print(f"  Saved -> {out}")
+    return preds, m
+
+
+def run_all(horizons=None, growth="flat", refit="step", max_test_days=None):
+    """Run all horizons with a SINGLE walk-forward: one fit per origin, all horizons jointly.
+
+    This is the conceptually correct approach for a recursive model: the daily
+    Prophet model is identical regardless of the forecast horizon -- only the
+    number of steps summed at the end differs. Fitting once per origin (instead
+    of once per origin per horizon) cuts compute cost by len(horizons)x.
+    """
+    horizons = horizons or HORIZONS
+    print(f"\n[Prophet] multi-horizon walk-forward "
+          f"(growth={growth}, refit={refit}, horizons={horizons}, lag-1 regressors)")
+
+    dates, endog, exog = load_data()
+    y = endog.to_numpy(dtype=float)
+    X = exog.to_numpy(dtype=float)
+
+    test_start = int(dates.searchsorted(pd.Timestamp(TEST_START)))
+    test_end   = len(y)
+    if TEST_END is not None:
+        test_end = int(dates.searchsorted(pd.Timestamp(TEST_END), side="right"))
+    if max_test_days is not None:
+        test_end = min(test_end, test_start + max_test_days)
+
+    print(f"  Train: {dates[0].date()} .. {dates[test_start-1].date()}  ({test_start} obs)")
+    print(f"  Test : {dates[test_start].date()} .. {dates[test_end-1].date()}  ({test_end-test_start} obs)")
+
+    model = ProphetModel(dates, REGRESSOR_COLS, growth=growth)
+    refit_positions = (set(range(test_start, test_end)) if refit == "step"
+                       else month_start_positions(dates, test_start, test_end))
+
+    all_preds = expanding_walk_forward_multi_horizon(
+        y, X, dates, test_start, model, refit_positions,
+        horizons=horizons, test_end=test_end,
+    )
+
+    train_drift = float(y[:test_start].mean())
+    results = {}
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    for h, preds in all_preds.items():
+        m = summary(preds["y_true"].to_numpy(), preds["y_pred"].to_numpy(),
+                    drift=train_drift, horizon=h)
+        results[h] = m
+        out = RESULTS_DIR / f"prophet_{h}d.csv"
+        preds.to_csv(out)
+        print(f"  Saved -> {out}")
+
+    print(f"\n{'='*64}\n  Prophet summary\n{'='*64}")
+    for h, m in results.items():
+        print(f"    h={h:>2}d   RMSE {m['rmse']:.5f} (zero {m['rmse_zero']:.5f}, drift {m['rmse_drift']:.5f})"
+              f"   MAE {m['mae']:.5f} (zero {m['mae_zero']:.5f}, drift {m['mae_drift']:.5f})"
+              f"   DA {m['da']:.3f} (up {m['da_up']:.3f}, edge {m['da_edge']:+.3f})")
+    return results
+
+
+if __name__ == "__main__":
+    import argparse
+    ap = argparse.ArgumentParser(description="Prophet multi-horizon walk-forward")
+    ap.add_argument("--horizon", type=int, default=None,
+                    help="single horizon in days (default: all in config.HORIZONS)")
+    ap.add_argument("--growth", choices=["flat", "linear"], default="flat",
+                    help="Prophet trend (default: flat, the SARIMAX trend='c' analog)")
+    ap.add_argument("--refit", choices=["step", "monthly"], default="step",
+                    help="refit every origin (default, comparable to SARIMAX) or monthly (fast dev)")
+    ap.add_argument("--max-test-days", type=int, default=None,
+                    help="limit the test horizon for a quick smoke run")
+    args = ap.parse_args()
+    if args.horizon is None:
+        run_all(growth=args.growth, refit=args.refit, max_test_days=args.max_test_days)
+    else:
+        run(horizon=args.horizon, growth=args.growth, refit=args.refit,
+            max_test_days=args.max_test_days)

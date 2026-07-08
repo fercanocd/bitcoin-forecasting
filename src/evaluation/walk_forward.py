@@ -51,6 +51,59 @@ def month_start_positions(dates: pd.DatetimeIndex, start: int, end: int) -> set[
     return refit
 
 
+def expanding_walk_forward_multi_horizon(
+    y: np.ndarray,
+    X: np.ndarray | None,
+    dates: pd.DatetimeIndex,
+    test_start: int,
+    model: WalkForwardModel,
+    refit_positions: set[int],
+    horizons: list[int],
+    test_end: int | None = None,
+    verbose: bool = True,
+) -> dict[int, pd.DataFrame]:
+    """Walk-forward loop that fits once per origin and scores all horizons jointly.
+
+    Correct for recursive models (SARIMAX, Prophet): the daily model is
+    identical across horizons, so fitting separately per horizon is redundant
+    and triples the compute cost for no benefit. At each origin the model is
+    fit once, then forecast(h) is called for every h in horizons before
+    observe() advances the state by one day.
+
+    For each horizon h, only origins where y[i:i+h] is fully observed are
+    scored (the last h-1 origins cannot be evaluated for that horizon).
+
+    Returns a dict {h: DataFrame(date, y_true, y_pred)} -- one entry per horizon.
+    """
+    n = len(y)
+    test_end = n if test_end is None else test_end
+    rows = {h: [] for h in horizons}
+    n_refits = 0
+
+    for i in range(test_start, test_end):
+        if i in refit_positions:
+            model.fit(y[:i], None if X is None else X[:i])
+            n_refits += 1
+        X_next = None if X is None else X[i:i + 1]
+        for h in horizons:
+            if i + h > n:           # future window not fully observed yet
+                continue
+            y_pred = model.forecast(h, X_next)
+            y_true = float(np.sum(y[i:i + h]))
+            rows[h].append((dates[i], y_true, y_pred))
+        model.observe(y[i:i + 1], None if X is None else X[i:i + 1])
+
+    if verbose:
+        counts = {h: len(rows[h]) for h in horizons}
+        print(f"  Walk-forward (joint): {n_refits} refits | "
+              + " | ".join(f"h={h}: {counts[h]} preds" for h in horizons))
+
+    return {
+        h: pd.DataFrame(rows[h], columns=["date", "y_true", "y_pred"]).set_index("date")
+        for h in horizons
+    }
+
+
 def expanding_walk_forward(
     y: np.ndarray,
     X: np.ndarray | None,
