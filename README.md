@@ -68,14 +68,43 @@ Log-returns are additive and approximately stationary, which makes them suitable
 - **Recursive (SARIMAX, Prophet):** a single daily model is fitted; the h-day forecast is obtained by iterating the model h times. The model is identical across horizons — only the number of projected steps differs. This means one walk-forward pass serves all three horizons simultaneously.
 - **Direct (XGBoost, LSTM):** a separate model is trained per horizon, optimising directly against the h-day target. Models are genuinely different across horizons (the optimal features and weights for 1-day ahead differ from those for 30-day ahead), so three independent walk-forward passes are required.
 
+### Two-level training scheme
+
+Model training operates at two distinct levels that never mix:
+
+**Level 1 — Hyperparameter selection (once, before the test period)**
+
+Determines the model configuration using only training data. Never touches the test set.
+
+| Model | What is decided | How |
+|---|---|---|
+| SARIMAX | Order `(p,d,q)`, which regressors to keep | AIC minimisation + p-value backward elimination on train window |
+| Prophet | `growth='flat'`, seasonality mode | Design choice (log-returns are ~zero-mean, piecewise trend would chase noise) |
+| XGBoost | `max_depth`, `learning_rate`, `n_estimators`, regularisation, ... | Time-series CV within train (expanding annual folds: train 2018–19 → val 2020, train 2018–20 → val 2021, ...) |
+| LSTM | Hidden size, layers, dropout, learning rate, batch size, ... | Same time-series CV as XGBoost |
+
+**Level 2 — Daily parameter refit (every origin in the test walk-forward)**
+
+With hyperparameters fixed, parameters (coefficients, tree weights, neural network weights) are re-estimated at each test origin using all data available up to that day. The training window grows by one observation daily.
+
+```
+Test walk-forward (hyperparameters frozen from Level 1)
+├── Origin 2024-01-01: fit on all data up to 2023-12-31 → predict 1/7/30d
+├── Origin 2024-01-02: fit on all data up to 2024-01-01 → predict 1/7/30d
+├── ...
+└── Origin 2026-05-20: fit on all data up to 2026-05-19 → predict 1/7/30d
+```
+
+The two levels are strictly separated: hyperparameters never see the test set; daily refits never change the hyperparameters.
+
 ### Train / test split
 
 | Set | Period | Observations | Role |
 |---|---|---|---|
-| **Train** | 2018-01-21 → 2023-12-31 | 2,171 days | Fit models, select regressors and order |
-| **Test** | 2024-01-01 → 2026-05-20 | 871 days | Out-of-sample honest evaluation |
+| **Train** | 2018-01-21 → 2023-12-31 | 2,171 days | Level 1: hyperparameter selection |
+| **Test** | 2024-01-01 → 2026-06-01 | 871 days | Level 2: daily refit + out-of-sample evaluation |
 
-There is no separate validation set. For the ML models (XGBoost, LSTM), hyperparameter selection is performed via time-series cross-validation entirely within the training window (expanding folds, no look-ahead).
+The train/test cut is set at end-2023 so the test period includes the April 2024 halving — a structural market event the model has never seen, making the evaluation genuinely out-of-sample.
 
 ### Evaluation metrics
 
