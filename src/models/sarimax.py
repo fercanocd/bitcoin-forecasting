@@ -54,7 +54,7 @@ import pandas as pd
 from statsmodels.tsa.statespace.sarimax import SARIMAX
 from statsmodels.tools.sm_exceptions import ConvergenceWarning
 
-from src.config import TEST_START, TEST_END, HORIZONS
+from src.config import TEST_START, TEST_END, HORIZONS, TRAIN_WINDOW
 from src.evaluation.metrics import summary
 from src.evaluation.walk_forward import (expanding_walk_forward,
                                          expanding_walk_forward_multi_horizon,
@@ -147,7 +147,9 @@ class SarimaxModel:
         self.seasonal_order = seasonal_order
         self.res = None
 
-    def fit(self, y_hist, X_hist):
+    def fit(self, y_hist, X_hist, t0=0):
+        # t0 (absolute start position) is unused: statsmodels works positionally
+        # on the values, so a rolling window is just a shorter y_hist/X_hist.
         self.res = SARIMAX(
             y_hist, exog=X_hist, order=self.order, trend=self.trend,
             seasonal_order=self.seasonal_order,
@@ -173,7 +175,7 @@ class SarimaxModel:
 
 
 def run(horizon=1, order=None, trend="c", keep_idx=None, select=True,
-        max_test_days=None, verbose=True, _data=None):
+        train_window=TRAIN_WINDOW, max_test_days=None, verbose=True, _data=None):
     print(f"\n[SARIMAX] {horizon}-day-ahead walk-forward (lag-1 exogenous)")
     dates, endog, exog = _data if _data is not None else load_data()
     y = endog.to_numpy(dtype=float)
@@ -186,7 +188,8 @@ def run(horizon=1, order=None, trend="c", keep_idx=None, select=True,
     if max_test_days is not None:
         test_end = min(test_end, test_start + max_test_days)
 
-    print(f"  Train: {dates[0].date()} .. {dates[test_start-1].date()}  ({test_start} obs)")
+    win = "expanding" if train_window is None else f"rolling {train_window}d"
+    print(f"  Train: {dates[0].date()} .. {dates[test_start-1].date()}  ({test_start} obs, {win})")
     print(f"  Test : {dates[test_start].date()} .. {dates[test_end-1].date()}  ({test_end-test_start} obs)")
 
     if order is None:
@@ -202,7 +205,8 @@ def run(horizon=1, order=None, trend="c", keep_idx=None, select=True,
 
     preds = expanding_walk_forward(
         y, X, dates, test_start, model, refit,
-        horizon=horizon, test_end=test_end, verbose=verbose,
+        horizon=horizon, test_end=test_end, train_window=train_window,
+        verbose=verbose,
     )
 
     train_drift = float(y[:test_start].mean())
@@ -221,7 +225,7 @@ def run(horizon=1, order=None, trend="c", keep_idx=None, select=True,
 
 
 def run_all(horizons=None, trend="c", select=True, refit="step",
-            max_test_days=None):
+            train_window=TRAIN_WINDOW, max_test_days=None):
     """Run all horizons with a SINGLE walk-forward: one fit per origin, all horizons jointly.
 
     This is the conceptually correct approach for a recursive model, and the
@@ -229,16 +233,25 @@ def run_all(horizons=None, trend="c", select=True, refit="step",
     the forecast horizon -- only the number of summed steps differs. Fitting
     once per origin (instead of once per origin per horizon) cuts compute cost
     by len(horizons)x with byte-identical results to running each horizon
-    separately. The order and significant regressor subset are still chosen
-    once on the initial training window and reused across horizons.
+    separately.
+
+    Two time-scales of adaptation:
+      * structure (order + significant regressor subset) is selected ONCE on
+        the full initial training window and frozen across the test -- a
+        low-frequency, structural decision reused across all horizons;
+      * coefficient values are re-estimated at each refit on a rolling
+        train_window of recent history (see config.TRAIN_WINDOW), so they
+        track the current regime rather than averaging in the thin 2018-19
+        market. train_window=None restores the expanding window.
 
     refit : "step" re-estimates every origin (matches the per-horizon default
             and Prophet); "monthly" refits at each month start and relies on
             SarimaxModel.observe's cheap Kalman filtering in between.
     """
     horizons = horizons or HORIZONS
+    win = "expanding" if train_window is None else f"rolling {train_window}d"
     print(f"\n[SARIMAX] multi-horizon walk-forward "
-          f"(trend={trend}, refit={refit}, horizons={horizons}, lag-1 exogenous)")
+          f"(trend={trend}, refit={refit}, window={win}, horizons={horizons}, lag-1 exogenous)")
 
     dates, endog, exog = load_data()
     y = endog.to_numpy(dtype=float)
@@ -251,7 +264,7 @@ def run_all(horizons=None, trend="c", select=True, refit="step",
     if max_test_days is not None:
         test_end = min(test_end, test_start + max_test_days)
 
-    print(f"  Train: {dates[0].date()} .. {dates[test_start-1].date()}  ({test_start} obs)")
+    print(f"  Train: {dates[0].date()} .. {dates[test_start-1].date()}  ({test_start} obs, {win})")
     print(f"  Test : {dates[test_start].date()} .. {dates[test_end-1].date()}  ({test_end-test_start} obs)")
 
     order = select_order(y[:test_start], X[:test_start], trend=trend)
@@ -266,7 +279,7 @@ def run_all(horizons=None, trend="c", select=True, refit="step",
 
     all_preds = expanding_walk_forward_multi_horizon(
         y, X, dates, test_start, model, refit_positions,
-        horizons=horizons, test_end=test_end,
+        horizons=horizons, test_end=test_end, train_window=train_window,
     )
 
     train_drift = float(y[:test_start].mean())
