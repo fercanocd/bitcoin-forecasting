@@ -94,15 +94,59 @@ trained models carry no exploitable signal beyond the naive constant. Written to
 
 ### Experimental design
 
-The experiment uses an **expanding walk-forward** evaluation scheme. At each test origin `t` the model is fitted exclusively on data up to `t−1` and then forecasts the next `h` days. The training window grows by one observation each day — no future data ever enters the fit. This mirrors realistic deployment: you forecast with what you know today.
+The experiment uses an **expanding walk-forward** evaluation scheme. At each test origin `t` the model is fitted exclusively on data up to `t−1` and then forecasts the next `h` days. The fit window grows by one observation each day — no future data ever enters the fit. This mirrors realistic deployment: you forecast with what you know today.
 
 ```
-|←————————— train ——————————→|←———— test (walk-forward) ————→|
- 2018-01-21              2023-12-31  2024-01-01          2026-06-01
-                                     ↑ origin 1
-                                          ↑ origin 2
-                                               ↑ ...  (883 origins)
+                              Level-1 boundary: hyperparameters frozen here
+                                         |
+ |========== fit window (keeps expanding into the test) ==========>
+ 2018-01-21                    2023-12-31 | 2024-01-01        2026-06-01
+                                          |  ^ origin 1   (refit on data <= 2023-12-31)
+                                          |   ^ origin 2  (refit on data <= 2024-01-01)
+                                          |    ^ ...       ... 883 origins, one per day
+                                          |
+                              [ hyperparameter-selection ][ test walk-forward ]
 ```
+
+**What "walk-forward on the test" means (and why it is not leakage).** The test is
+not one train-then-evaluate split; it is 883 successive *refit-and-forecast* steps.
+At each origin the parameters are re-estimated on **all data up to the previous day**
+and used to forecast the next `h` days — so the fit window keeps **expanding into the
+test period** as the walk proceeds. This is not cheating: to forecast day `t` only
+data strictly before `t` is used, so every forecast is genuinely out-of-sample at the
+moment it is made. The `2023-12-31` line is *not* where fitting stops — it is only
+where **hyperparameter selection** stops (Level 1). During the walk (Level 2) the
+hyperparameters stay frozen while the **parameters** refit on the growing window.
+
+**Round 1 (before the test): expanding-window cross-validation.** The
+hyperparameters are chosen entirely within the training era using expanding
+folds. Each fold trains on the past and validates on the *single next year*;
+the validation window slides forward one year per fold while the training
+window expands behind it. The four folds tile 2020–2023 exactly once each
+(equal weight, no overlap), and none ever crosses into the 2024–2026 test:
+
+```
+         2018  2019  2020  2021  2022  2023   | 2024  2025  26
+overview TRAIN + VALIDATION (2018-2023)        | [==== test (fixed) ====]
+fold 1   ============######                    | [==== test (fixed) ====]
+fold 2   ==================######              | [==== test (fixed) ====]
+fold 3   ========================######        | [==== test (fixed) ====]
+fold 4   ==============================######   | [==== test (fixed) ====]
+
+  =  train (expands each fold)     #  validation (1 year, slides right)
+  gap between # and | = years not used in that fold
+  test = fixed block 2024-2026, identical and aligned in every row
+```
+
+Validation reaches right up to the test wall but never crosses it: the last
+fold validates 2023, the year immediately before the test. Validating 2024
+would mean using test data to choose hyperparameters — the leakage this
+split is designed to prevent. (2018–2019 are never a validation year: the
+first fold needs at least two years of history to train on.) Why not let each
+fold validate *everything* up to the test? Because that would weight the
+later years far more heavily (2023 would appear in every fold, 2020 in only
+one) and force early folds to forecast years ahead on a stale, tiny training
+set — neither balanced nor realistic.
 
 ### Target variable
 
