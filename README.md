@@ -96,27 +96,15 @@ trained models carry no exploitable signal beyond the naive constant. Written to
 
 The experiment uses an **expanding walk-forward** evaluation scheme. At each test origin `t` the model is fitted exclusively on data up to `t−1` and then forecasts the next `h` days. The fit window grows by one observation each day — no future data ever enters the fit. This mirrors realistic deployment: you forecast with what you know today.
 
-```
-                              Level-1 boundary: hyperparameters frozen here
-                                         |
- |========== fit window (keeps expanding into the test) ==========>
- 2018-01-21                    2023-12-31 | 2024-01-01        2026-06-01
-                                          |  ^ origin 1   (refit on data <= 2023-12-31)
-                                          |   ^ origin 2  (refit on data <= 2024-01-01)
-                                          |    ^ ...       ... 883 origins, one per day
-                                          |
-                              [ hyperparameter-selection ][ test walk-forward ]
-```
-
 **What "walk-forward on the test" means (and why it is not leakage).** The test is
 not one train-then-evaluate split; it is 883 successive *refit-and-forecast* steps.
 At each origin the parameters are re-estimated on **all data up to the previous day**
 and used to forecast the next `h` days — so the fit window keeps **expanding into the
 test period** as the walk proceeds. This is not cheating: to forecast day `t` only
 data strictly before `t` is used, so every forecast is genuinely out-of-sample at the
-moment it is made. The `2023-12-31` line is *not* where fitting stops — it is only
-where **hyperparameter selection** stops (Level 1). During the walk (Level 2) the
-hyperparameters stay frozen while the **parameters** refit on the growing window.
+moment it is made. The end of the 2018–2023 window is *not* where fitting stops — it
+is only where **hyperparameter selection** stops (Level 1). During the walk (Level 2)
+the hyperparameters stay frozen while the **parameters** refit on the growing window.
 
 **Round 1 (before the test): expanding-window cross-validation.** The
 hyperparameters are chosen entirely within the training era using expanding
