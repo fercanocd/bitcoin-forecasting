@@ -30,11 +30,14 @@ disk, so the reported numbers never drift from the code:
   (`time_val` / `time_test`) and a `beats_drift` flag.
 - **`reports/metrics/diebold_mariano.md`** — pairwise Diebold-Mariano tests on the
   test set (which RMSE differences are statistically real).
+- **`reports/metrics/ensemble_*.md`** — forecast-combination results: the weights,
+  the out-of-sample scorecard, and the validation error covariance/correlation
+  that explains them (see *Forecast combination* below).
 - **`reports/metrics/*.csv`** — the same tables in machine-readable form.
 - **`reports/predictions/runtimes.csv`** — persistent log of every model's
   training time, written incrementally: re-running one model updates only its
   own row.
-- **`reports/figures/07…14_*.png`** — the result figures (see below).
+- **`reports/figures/07…16_*.png`** — the result figures (see below).
 
 Rebuild them at any time without re-training:
 
@@ -60,6 +63,30 @@ set the bar the ML models (XGBoost, LSTM) must clear to add value.
 | 12 | Validation vs test RMSE — generalisation / overfitting check | CV + test |
 | 13 | XGBoost gain importance, top features per horizon | train fit |
 | 14 | Diebold-Mariano pairwise significance heatmap | test |
+| 15 | Ensemble test RMSE by weighting scheme vs best-single / drift | CV + test |
+| 16 | Validation error-correlation heatmap (diversification diagnostic) | CV |
+
+### Forecast combination (ensemble)
+
+As a final robustness check, the four model forecasts are combined — portfolio
+theory applied to forecasts instead of assets — to ask whether *any* weighting
+beats the best single model. Three schemes are fitted **on the validation errors
+only** (the test set is never used to choose a weight) and scored out-of-sample:
+
+- **equal** — `1/N`;
+- **inverse-RMSE** — weight by individual accuracy;
+- **minimum-variance** — long-only `argmin w'Σw`, the Bates-Granger combination
+  (the direct analogue of a minimum-variance portfolio).
+
+The finding reinforces the main result rather than overturning it: the models'
+errors are correlated at **0.85–0.98**, so there is almost no idiosyncratic
+error to diversify away. Minimum-variance collapses to equal weights at short
+horizons (near-identical, near-perfectly-correlated forecasts) and concentrates
+on SARIMAX at h=30. In an **augmented pool** where the `predict-drift` baseline
+is allowed to compete, the optimum keeps drift as ~half the allocation
+(54% SARIMAX / 46% drift at h=30) — the cleanest possible statement that the
+trained models carry no exploitable signal beyond the naive constant. Written to
+`reports/metrics/ensemble_*` and figures 15–16.
 
 ---
 
@@ -178,9 +205,9 @@ bitcoin-forecasting/
 │   ├── raw/                        # btc_ohlcv.csv, macro_raw.csv (Yahoo Finance)
 │   └── processed/                  # arima / prophet / xgboost / lstm feature CSVs
 ├── reports/                        # gitignored — regenerate with: python pipeline.py --only-report
-│   ├── figures/                    # EDA plots (01-06) + result figures (07-14) + candlestick
-│   ├── metrics/                    # comparison + Diebold-Mariano tables (CSV + markdown)
-│   └── predictions/                # walk-forward predictions: {model}_{h}d.csv (+ cv/)
+│   ├── figures/                    # EDA plots (01-06) + result figures (07-16)
+│   ├── metrics/                    # comparison + Diebold-Mariano + ensemble tables (CSV + markdown)
+│   └── predictions/                # walk-forward predictions: {model}_{h}d.csv (+ cv/, runtimes.csv)
 ├── src/
 │   ├── config.py                   # Central config: dates, horizons, seed
 │   ├── data/
@@ -196,11 +223,13 @@ bitcoin-forecasting/
 │   │   ├── metrics.py              # RMSE, MAE, DA, DA edge, Diebold-Mariano
 │   │   ├── walk_forward.py         # Expanding walk-forward engine (recursive + direct)
 │   │   ├── cv.py                   # Round-1 CV folds + aggregation
-│   │   └── compare.py              # Four-model comparison tables + DM (reports/metrics/)
+│   │   ├── runtime.py              # Per-model training-time log (reports/predictions/runtimes.csv)
+│   │   ├── compare.py              # Four-model comparison tables + DM (reports/metrics/)
+│   │   └── ensemble.py             # Forecast combination: equal / inv-RMSE / min-variance
 │   └── visualization/
 │       ├── style.py                # Shared figure style (EDA + results)
 │       ├── eda_plots.py            # Static EDA figures (01-06)
-│       └── results_plots.py        # Result figures (07-14) from saved predictions
+│       └── results_plots.py        # Result figures (07-16) from saved predictions
 ├── pipeline.py                     # End-to-end pipeline orchestrator
 └── requirements.txt
 ```
@@ -252,7 +281,8 @@ python -m src.models.lstm_model
 
 ```bash
 python -m src.evaluation.compare                    # comparison tables + DM tests
-python -m src.visualization.results_plots           # result figures 07-14
+python -m src.evaluation.ensemble                   # forecast-combination tables
+python -m src.visualization.results_plots           # result figures 07-16
 python -m src.visualization.results_plots --only 07 # a single figure
 python -m src.visualization.eda_plots               # EDA figures 01-06
 ```
@@ -277,7 +307,7 @@ Macro series are only available on exchange trading days; weekend/holiday gaps a
 
 ## Tech Stack
 
-Python · statsmodels · prophet · xgboost · PyTorch · yfinance · pandas · ta · scipy · Plotly · matplotlib
+Python · statsmodels · prophet · xgboost · PyTorch · yfinance · pandas · ta · scipy · matplotlib · seaborn
 
 ---
 
