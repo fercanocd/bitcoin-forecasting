@@ -2,9 +2,12 @@
 Cross-validation harness for Round 1 (hyperparameter / structure selection).
 
 Expanding-window folds keyed on calendar years: the train portion always starts
-at 2018-01-01 and grows one year at a time; the validation portion is one
+at TRAIN_START and grows one year at a time; the validation portion is one
 calendar year. Every model (SARIMAX, Prophet, XGBoost, LSTM) shares the same
 fold definition so their validation metrics are strictly comparable.
+
+With the current config (TRAIN_START=2018-01-01, MIN_TRAIN_YEARS=2,
+TEST_START=2024-01-01) the four folds are:
 
   Fold 1: train 2018-01-01 .. 2019-12-31  |  val = 2020
   Fold 2: train 2018-01-01 .. 2020-12-31  |  val = 2021
@@ -21,7 +24,29 @@ from dataclasses import dataclass
 import numpy as np
 import pandas as pd
 
-DEFAULT_VAL_YEARS = [2020, 2021, 2022, 2023]
+from src.config import MIN_TRAIN_YEARS, TEST_START, TRAIN_START
+
+
+def _derive_val_years(train_start: str = TRAIN_START,
+                      test_start: str = TEST_START,
+                      min_train_years: int = MIN_TRAIN_YEARS) -> list[int]:
+    """Derive the CV validation years from the train/test window.
+
+    First validation year = the year that starts once the training window has
+    covered at least ``min_train_years`` full calendar years. Last validation
+    year = the year just before the test window opens. Kept as a function
+    (not a module constant computed at import time) so it re-evaluates if the
+    dates in config change during a session -- and so tests can override.
+    """
+    y0 = pd.Timestamp(train_start).year + min_train_years
+    y1 = pd.Timestamp(test_start).year        # exclusive: val ends before test
+    if y0 >= y1:
+        raise ValueError(f"No CV folds fit between train_start={train_start} and "
+                         f"test_start={test_start} with min_train_years={min_train_years}")
+    return list(range(y0, y1))
+
+
+DEFAULT_VAL_YEARS = _derive_val_years()
 
 
 @dataclass

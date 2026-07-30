@@ -48,7 +48,9 @@ from sklearn.preprocessing import StandardScaler
 from src.config import (HORIZONS, SEED, TEST_END, TEST_START, TRAIN_START)
 from src.evaluation.cv import (DEFAULT_VAL_YEARS, aggregate_metrics, year_folds)
 from src.evaluation.metrics import summary
+from src.evaluation.runtime import measure, record
 from src.evaluation.walk_forward import month_start_positions
+import time
 
 PROCESSED_DIR = Path(__file__).resolve().parents[2] / "data" / "processed"
 RESULTS_DIR   = Path(__file__).resolve().parents[2] / "reports" / "predictions"
@@ -249,7 +251,8 @@ def _cv_one_combo(horizon: int, hparams: dict, dates, y, X, folds,
         X_va, y_va, positions = make_sequences(X_scaled, y, SEQ_LEN, f.val_start, val_end)
         y_pred        = _predict(model, X_va)
 
-        fold_drift = float(y[f.train_start:train_end].mean())
+        # y is the h-day cumulative target; divide by h to recover mu_daily.
+        fold_drift = float(y[f.train_start:train_end].mean()) / horizon
         m          = summary(y_va, y_pred, drift=fold_drift, horizon=horizon)
         per_fold[f.val_year]        = m
         per_fold_preds[f.val_year]  = (dates[positions], y_va, y_pred)
@@ -272,6 +275,7 @@ def run_cv(horizons=None, val_years=None, max_val_days=None, verbose=True):
     hparams_rows = []
 
     for h in horizons:
+        t0 = time.time()
         print(f"\n  --- horizon = {h}d ---")
         dates, y, X = load_data(h)
         folds       = year_folds(dates, val_years=val_years, train_start_date=TRAIN_START)
@@ -315,6 +319,9 @@ def run_cv(horizons=None, val_years=None, max_val_days=None, verbose=True):
             "da_edge": best_agg["da_edge"], "da_edge_std": best_agg["da_edge_std"],
             "n_total": best_agg["n_total"],
         })
+        record("lstm", h, "cv", time.time() - t0,
+               refit="static-per-fold",
+               n_predictions=int(best_agg["n_total"]))
 
     pd.DataFrame(hparams_rows).to_csv(cv_dir / "lstm_best_hparams.csv", index=False)
     print(f"\n  Best hparams saved -> {cv_dir / 'lstm_best_hparams.csv'}")
@@ -365,8 +372,9 @@ def run(horizon=1, hparams=None, max_test_days=None, verbose=True, _data=None):
     print(f"  Refits: {len(refit_positions)} monthly")
 
     model, prev_state, X_scaled = None, None, None
-    rows = []
+    rows: list = []
 
+    t0 = time.time()
     for i in range(test_start, test_end):
         if i in refit_positions:
             train_end = i - horizon + 1
@@ -390,9 +398,14 @@ def run(horizon=1, hparams=None, max_test_days=None, verbose=True, _data=None):
         with torch.no_grad():
             y_pred = float(model(torch.from_numpy(x_pred)).item())
         rows.append((dates[i], float(y[i]), y_pred))
+    record("lstm", horizon, "test", time.time() - t0,
+           refit="monthly", n_predictions=len(rows))
 
     preds = pd.DataFrame(rows, columns=["date", "y_true", "y_pred"]).set_index("date")
-    train_drift = float(y[:test_start].mean())
+    # y is target_log_return_{h}d (cumulative h-day return), so y.mean() is
+    # already h * mu_daily. summary() multiplies by horizon again, so divide
+    # here to recover the daily drift and keep the predict-drift baseline honest.
+    train_drift = float(y[:test_start].mean()) / horizon
     m = summary(preds["y_true"].to_numpy(), preds["y_pred"].to_numpy(),
                 drift=train_drift, horizon=horizon)
     print(f"  Results: n={m['n']}  "
@@ -406,13 +419,15 @@ def run(horizon=1, hparams=None, max_test_days=None, verbose=True, _data=None):
     return preds, m
 
 
-def run_all(horizons=None, hparams_by_h=None, max_test_days=None):
+def run_all(horizons=None, hparams_by_h=None, max_test_days=None, verbose=True):
+    """``verbose=False`` suppresses the per-refit progress lines."""
     horizons = horizons or HORIZONS
     print(f"\n[LSTM] multi-horizon test walk-forward (horizons={horizons})")
     results = {}
     for h in horizons:
         hp = None if hparams_by_h is None else hparams_by_h.get(h)
-        _, m = run(horizon=h, hparams=hp, max_test_days=max_test_days)
+        _, m = run(horizon=h, hparams=hp, max_test_days=max_test_days,
+                   verbose=verbose)
         results[h] = m
 
     print(f"\n{'='*72}\n  LSTM summary\n{'='*72}")

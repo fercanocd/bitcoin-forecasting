@@ -22,20 +22,44 @@ All models share the same prediction target (h-day cumulative log-return) and ar
 
 ## Results
 
-Out-of-sample walk-forward results (test period 2024-01-01 → 2026-05-20, n=871 origins). `edge` = DA − DA_up (directional skill over the "always predict up" baseline).
+The comparison is regenerated from the saved predictions every run and written to
+disk, so the reported numbers never drift from the code:
 
-| Model | h | RMSE | vs drift | DA | edge |
-|---|---|---|---|---|---|
-| SARIMAX | 1d | 0.02534 | +0.000 | 0.520 | +0.014 |
-| SARIMAX | 7d | 0.06266 | +0.001 | 0.535 | +0.001 |
-| SARIMAX | 30d | 0.14137 | +0.001 | 0.537 | +0.000 |
-| Prophet | 1d | 0.02557 | +0.001 | 0.504 | −0.002 |
-| Prophet | 7d | 0.06834 | +0.009 | 0.482 | −0.052 |
-| Prophet | 30d | 0.16296 | +0.023 | 0.503 | −0.034 |
-| XGBoost | — | — | — | — | — |
-| LSTM | — | — | — | — | — |
+- **`reports/metrics/comparison_master.md`** — Validation (CV) vs Test, per model
+  and horizon, with the `predict-drift` baseline, wall-clock training time
+  (`time_val` / `time_test`) and a `beats_drift` flag.
+- **`reports/metrics/diebold_mariano.md`** — pairwise Diebold-Mariano tests on the
+  test set (which RMSE differences are statistically real).
+- **`reports/metrics/*.csv`** — the same tables in machine-readable form.
+- **`reports/predictions/runtimes.csv`** — persistent log of every model's
+  training time, written incrementally: re-running one model updates only its
+  own row.
+- **`reports/figures/07…14_*.png`** — the result figures (see below).
 
-**Key findings (baselines):** Neither SARIMAX nor Prophet beats the predict-drift baseline in RMSE. SARIMAX posts a small positive DA edge at h=1 (+0.014), attributable to ETH co-movement; all other edges are ≈ 0 or negative. Prophet is worse than SARIMAX at every horizon, increasingly so as h grows. These results set the bar for the ML models.
+Rebuild them at any time without re-training:
+
+```bash
+python pipeline.py --only-report      # tables + figures from whatever predictions exist
+```
+
+**Baseline findings (SARIMAX, Prophet).** Neither classical baseline beats the
+`predict-drift` reference in RMSE. SARIMAX posts only a marginal positive
+directional edge at h=1 (attributable to ETH co-movement); all longer-horizon
+edges are ≈ 0. Prophet degrades relative to SARIMAX as the horizon grows. These
+set the bar the ML models (XGBoost, LSTM) must clear to add value.
+
+### Result figures (`reports/figures/`)
+
+| # | Figure | Reads |
+|---|---|---|
+| 07 | RMSE per model/horizon vs the `predict-drift` / `predict-zero` baselines | test |
+| 08 | Directional accuracy vs the `always-up` baseline (edge) | test |
+| 09 | Forecast vs realised return over the test period (h=1 grid) | test |
+| 10 | Sign-of-forecast trading strategy equity vs buy-and-hold (h=1) | test |
+| 11 | Predicted vs realised scatter — the shrinkage that explains RMSE ≈ baseline | test |
+| 12 | Validation vs test RMSE — generalisation / overfitting check | CV + test |
+| 13 | XGBoost gain importance, top features per horizon | train fit |
+| 14 | Diebold-Mariano pairwise significance heatmap | test |
 
 ---
 
@@ -47,10 +71,10 @@ The experiment uses an **expanding walk-forward** evaluation scheme. At each tes
 
 ```
 |←————————— train ——————————→|←———— test (walk-forward) ————→|
- 2018-01-21              2023-12-31  2024-01-01          2026-05-20
+ 2018-01-21              2023-12-31  2024-01-01          2026-06-01
                                      ↑ origin 1
                                           ↑ origin 2
-                                               ↑ ...  (871 origins)
+                                               ↑ ...  (883 origins)
 ```
 
 ### Target variable
@@ -68,6 +92,8 @@ Log-returns are additive and approximately stationary, which makes them suitable
 - **Recursive (SARIMAX, Prophet):** a single daily model is fitted; the h-day forecast is obtained by iterating the model h times. The model is identical across horizons — only the number of projected steps differs. This means one walk-forward pass serves all three horizons simultaneously.
 - **Direct (XGBoost, LSTM):** a separate model is trained per horizon, optimising directly against the h-day target. Models are genuinely different across horizons (the optimal features and weights for 1-day ahead differ from those for 30-day ahead), so three independent walk-forward passes are required.
 
+**Date-label convention.** The two families label a forecast by different dates: a recursive-model row dated `d` holds the return realised *on* `d` (forecast from information up to `d−1`), whereas a direct-model row dated `d` holds `ln(P_{d+h}/P_d)`, the return realised *over* `(d, d+h]` (forecast from information up to `d`). Both solve the identical task — predict the next h-day return from everything known at the current close — so each model's own aggregate metrics are directly comparable. For the pairwise Diebold-Mariano tests and the overlay figures, `src/evaluation/compare.py` re-keys every series onto the common **origin-close date** (recursive: `d−1`; direct: `d`) so the paired `y_true` values match by construction.
+
 ### Two-level training scheme
 
 Model training operates at two distinct levels that never mix:
@@ -83,26 +109,35 @@ Determines the model configuration using only training data. Never touches the t
 | XGBoost | `max_depth`, `learning_rate`, `n_estimators`, regularisation, ... | Time-series CV within train (expanding annual folds: train 2018–19 → val 2020, train 2018–20 → val 2021, ...) |
 | LSTM | Hidden size, layers, dropout, learning rate, batch size, ... | Same time-series CV as XGBoost |
 
-**Level 2 — Daily parameter refit (every origin in the test walk-forward)**
+**Level 2 — Parameter refit during the test walk-forward**
 
-With hyperparameters fixed, parameters (coefficients, tree weights, neural network weights) are re-estimated at each test origin using all data available up to that day. The training window grows by one observation daily.
+With hyperparameters fixed, parameters (coefficients, tree weights, neural network weights) are re-estimated over the test period on an expanding window. The refit cadence differs by model family for one reason only — the marginal benefit of a one-day-newer fit relative to its compute cost:
+
+| Family | Refit cadence | Rationale |
+|---|---|---|
+| SARIMAX, Prophet | **Daily** | Each fit is cheap (few coefficients, closed / near-closed form) and, since the h-day forecast is obtained by iterating the daily model h times, a stale fit propagates its error through every horizon. |
+| XGBoost, LSTM | **Monthly** | Each fit is expensive (up to 1 000 boosted trees or many epochs of backprop over 60-step sequences). Trees and network weights are stable to a one-day extension of the training set, so daily refits would multiply compute cost 30× for a negligible reduction in error. |
+
+Between refits, the frozen model is used for daily prediction (it is only the parameter *re-estimation* that pauses, not the forecasting). Both cadences fit an *expanding* window whose start is fixed at 2018-01-21.
 
 ```
 Test walk-forward (hyperparameters frozen from Level 1)
-├── Origin 2024-01-01: fit on all data up to 2023-12-31 → predict 1/7/30d
-├── Origin 2024-01-02: fit on all data up to 2024-01-01 → predict 1/7/30d
+├── Origin 2024-01-01  → fit + predict 1/7/30d                (all models refit here)
+├── Origin 2024-01-02  → predict 1/7/30d                       (recursive: refit; ML: reuse)
 ├── ...
-└── Origin 2026-05-20: fit on all data up to 2026-05-19 → predict 1/7/30d
+├── Origin 2024-02-01  → predict 1/7/30d                       (all models refit here)
+├── ...
+└── Origin 2026-06-01  → predict 1/7/30d
 ```
 
-The two levels are strictly separated: hyperparameters never see the test set; daily refits never change the hyperparameters.
+The two levels are strictly separated: hyperparameters never see the test set; parameter refits never change the hyperparameters.
 
 ### Train / test split
 
 | Set | Period | Observations | Role |
 |---|---|---|---|
 | **Train** | 2018-01-21 → 2023-12-31 | 2,171 days | Level 1: hyperparameter selection |
-| **Test** | 2024-01-01 → 2026-06-01 | 871 days | Level 2: daily refit + out-of-sample evaluation |
+| **Test** | 2024-01-01 → 2026-06-01 | 883 days | Level 2: parameter refit + out-of-sample evaluation |
 
 The train/test cut is set at end-2023 so the test period includes the April 2024 halving — a structural market event the model has never seen, making the evaluation genuinely out-of-sample.
 
@@ -142,9 +177,10 @@ bitcoin-forecasting/
 ├── data/                           # gitignored — regenerate with: python pipeline.py
 │   ├── raw/                        # btc_ohlcv.csv, macro_raw.csv (Yahoo Finance)
 │   └── processed/                  # arima / prophet / xgboost / lstm feature CSVs
-├── reports/                        # gitignored — regenerate with eda_plots.py
-│   ├── figures/                    # EDA plots + interactive candlestick chart
-│   └── predictions/                # walk-forward predictions: sarimax/prophet_{h}d.csv
+├── reports/                        # gitignored — regenerate with: python pipeline.py --only-report
+│   ├── figures/                    # EDA plots (01-06) + result figures (07-14) + candlestick
+│   ├── metrics/                    # comparison + Diebold-Mariano tables (CSV + markdown)
+│   └── predictions/                # walk-forward predictions: {model}_{h}d.csv (+ cv/)
 ├── src/
 │   ├── config.py                   # Central config: dates, horizons, seed
 │   ├── data/
@@ -158,10 +194,13 @@ bitcoin-forecasting/
 │   │   └── lstm_model.py           # Walk-forward LSTM — PyTorch (direct, one model per horizon)
 │   ├── evaluation/
 │   │   ├── metrics.py              # RMSE, MAE, DA, DA edge, Diebold-Mariano
-│   │   └── walk_forward.py         # Expanding walk-forward engine (recursive + direct)
+│   │   ├── walk_forward.py         # Expanding walk-forward engine (recursive + direct)
+│   │   ├── cv.py                   # Round-1 CV folds + aggregation
+│   │   └── compare.py              # Four-model comparison tables + DM (reports/metrics/)
 │   └── visualization/
-│       ├── eda_plots.py            # Static EDA figures
-│       └── candlestick_interactive.py  # Interactive HTML candlestick chart
+│       ├── style.py                # Shared figure style (EDA + results)
+│       ├── eda_plots.py            # Static EDA figures (01-06)
+│       └── results_plots.py        # Result figures (07-14) from saved predictions
 ├── pipeline.py                     # End-to-end pipeline orchestrator
 └── requirements.txt
 ```
@@ -179,21 +218,43 @@ python -m venv .venv
 pip install -r requirements.txt
 ```
 
-**Run the full pipeline** (ingest → features → all models → evaluation):
+**Run the full pipeline** (ingest → features → all models → report):
 
 ```bash
-python pipeline.py
+python pipeline.py                    # everything
+python pipeline.py --skip-ingest      # reuse existing raw CSVs
+python pipeline.py --cv               # also run Round-1 hyperparameter CV
+python pipeline.py --only-report      # rebuild tables + figures only (no training)
+python pipeline.py --eda              # also (re)generate the EDA figures
+python pipeline.py --quiet            # suppress per-refit / per-combo progress lines
 ```
 
-**Run individual models:**
+**Fast sanity checks** — end-to-end but abbreviated (seconds instead of hours):
+
+```bash
+python pipeline.py --skip-ingest --skip-features --smoke 20        # ~1 min (all 4 models + report, 20 test days)
+python pipeline.py --skip-ingest --skip-features --smoke 30 --cv   # ~5-10 min (also CV, 30 val days per fold)
+```
+
+**Run individual models** (all write `reports/predictions/{model}_{h}d.csv`):
 
 ```bash
 python -m src.models.sarimax                        # all horizons
 python -m src.models.sarimax --horizon 1            # single horizon
 python -m src.models.sarimax --refit monthly        # fast dev run (monthly refit)
 python -m src.models.prophet_model
-python -m src.models.xgboost_model
+python -m src.models.xgboost_model                  # monthly refit; --refit step for daily
+python -m src.models.xgboost_model --cv             # Round-1 grid search
 python -m src.models.lstm_model
+```
+
+**Build the comparison and figures** (from whatever predictions exist on disk):
+
+```bash
+python -m src.evaluation.compare                    # comparison tables + DM tests
+python -m src.visualization.results_plots           # result figures 07-14
+python -m src.visualization.results_plots --only 07 # a single figure
+python -m src.visualization.eda_plots               # EDA figures 01-06
 ```
 
 ---

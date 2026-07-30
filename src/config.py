@@ -6,13 +6,6 @@ evaluation modules share a single source of truth.
 """
 
 # ---------------------------------------------------------------------------
-# Data
-# ---------------------------------------------------------------------------
-
-DATA_START = "2018-01-01"
-DATA_END   = "2026-06-01"
-
-# ---------------------------------------------------------------------------
 # Forecasting horizons
 # ---------------------------------------------------------------------------
 
@@ -28,17 +21,23 @@ TEST_START  = "2024-01-01"
 TEST_END    = "2026-06-01"  
 
 # ---------------------------------------------------------------------------
-# Time-series cross-validation (hyperparameter tuning on train set)
+# Time-series cross-validation (Round 1: hyperparameter selection on train)
 # ---------------------------------------------------------------------------
+# Expanding annual folds: the first fold trains on MIN_TRAIN_YEARS full
+# calendar years starting at TRAIN_START, validates on the next year, then
+# each subsequent fold extends the train window by one year. The list of
+# validation years is derived in src/evaluation/cv.py from TRAIN_START,
+# TEST_START and MIN_TRAIN_YEARS -- if any of those move, the folds move
+# with them automatically.
 
-FOLD_UNIT       = "year"   # each fold expands by one year
-MIN_TRAIN_YEARS = 2        # minimum years in the first fold's training window
+MIN_TRAIN_YEARS = 2
 
 # ---------------------------------------------------------------------------
-# Walk-forward (test set evaluation)
+# Walk-forward (Round 2: test evaluation)
 # ---------------------------------------------------------------------------
-
-REFIT_FREQ = "ME"          # pandas offset alias: month-end refit
+# Refit cadence differs by model family and is set in each model file:
+#   SARIMAX, Prophet  -> daily refit (cheap, and h-step forecasts compound)
+#   XGBoost, LSTM     -> monthly refit (expensive, weights are stable)
 
 # Rolling training window for daily coefficient refits, in calendar days.
 # None => expanding window (all history since TRAIN_START) -- the default.
@@ -47,6 +46,15 @@ REFIT_FREQ = "ME"          # pandas offset alias: month-end refit
 # thin, structurally different 2018-2019 market. Kept as a switch for the
 # rolling-vs-expanding robustness analysis; expanding is the official setting.
 TRAIN_WINDOW = None
+
+# ---------------------------------------------------------------------------
+# Statistical inference
+# ---------------------------------------------------------------------------
+
+# Two-sided significance level for the Diebold-Mariano test on the test set.
+# 0.05 is the Fisher-standard convention; kept here as the single source of
+# truth so the thesis can reference one number without hunting through code.
+DM_ALPHA = 0.05
 
 # ---------------------------------------------------------------------------
 # Reproducibility

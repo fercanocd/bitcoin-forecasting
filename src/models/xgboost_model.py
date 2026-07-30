@@ -17,9 +17,15 @@ Strategy:
     portion, predict all val rows in one batch. Cheap approximation to
     walk-forward inside val; the point of Round 1 is to rank hyperparameters,
     not to produce publishable metrics.
-  * Round 2 (test): DAILY walk-forward -- at each origin i in the test range,
-    refit on all rows [0, i - h + 1) and predict X[i]. Matches the SARIMAX /
-    Prophet test protocol so the four models are strictly comparable.
+  * Round 2 (test): MONTHLY refit by default -- at the first origin of each
+    calendar month, refit on all rows whose target is fully observable
+    (positions [0, i - h + 1)) and reuse that model for every day of the
+    month. Trees are stable to a one-day extension of the training set, so
+    daily refitting adds compute cost without meaningful adaptation. LSTM
+    already refits monthly for the same reason; matching XGBoost to that
+    cadence keeps the two ML families comparable and slashes total fit count
+    from ~883 to ~30 per horizon. Pass ``refit="step"`` to force the legacy
+    daily-refit protocol for the SARIMAX/Prophet parity experiment.
   * Fixed base hyperparameters: reg:squarederror, tree_method="hist", uniform
     sample weights, 10% of the (chronological) train tail used as internal
     val for early stopping (auto-selects n_estimators).
@@ -41,6 +47,9 @@ import xgboost as xgb
 from src.config import (HORIZONS, SEED, TEST_END, TEST_START, TRAIN_START)
 from src.evaluation.cv import (DEFAULT_VAL_YEARS, aggregate_metrics, year_folds)
 from src.evaluation.metrics import summary
+from src.evaluation.runtime import measure, record
+from src.evaluation.walk_forward import month_start_positions
+import time
 
 PROCESSED_DIR = Path(__file__).resolve().parents[2] / "data" / "processed"
 RESULTS_DIR   = Path(__file__).resolve().parents[2] / "reports" / "predictions"
@@ -127,7 +136,9 @@ def _cv_one_combo(horizon: int, params: dict, dates, y, X, folds,
         model = _fit_es(X_tr, y_tr, params)
         y_pred = model.predict(X_va)
 
-        fold_drift = float(y_tr.mean())     # drift from train only (no leakage)
+        # y_tr is the h-day cumulative target; divide by h to recover mu_daily
+        # (see run() for the full explanation).
+        fold_drift = float(y_tr.mean()) / horizon
         m = summary(y_va, y_pred, drift=fold_drift, horizon=horizon)
         per_fold[f.val_year] = m
 
@@ -159,6 +170,7 @@ def run_cv(horizons=None, val_years=None, max_val_days=None, save_preds=False,
     hparams_rows = []
 
     for h in horizons:
+        t0 = time.time()
         print(f"\n  --- horizon = {h}d ---")
         dates, y, X = load_data(h)
         folds = year_folds(dates, val_years=val_years, train_start_date=TRAIN_START)
@@ -204,6 +216,9 @@ def run_cv(horizons=None, val_years=None, max_val_days=None, save_preds=False,
             "da_edge": best_agg["da_edge"], "da_edge_std": best_agg["da_edge_std"],
             "n_total": best_agg["n_total"],
         })
+        record("xgboost", h, "cv", time.time() - t0,
+               refit="static-per-fold",
+               n_predictions=int(best_agg["n_total"]))
 
     pd.DataFrame(hparams_rows).to_csv(cv_dir / "xgboost_best_hparams.csv", index=False)
     print(f"\n  Best hparams saved -> {cv_dir / 'xgboost_best_hparams.csv'}")
@@ -249,12 +264,14 @@ def _load_best_hparams(horizon: int) -> dict:
                 subsample=float(row["subsample"]))
 
 
-def run(horizon=1, hparams=None, max_test_days=None, verbose=True, _data=None):
-    """Daily walk-forward on the test window with fixed hparams.
+def run(horizon=1, hparams=None, refit="monthly", max_test_days=None,
+        verbose=True, _data=None):
+    """Test walk-forward for one horizon with fixed hparams.
 
-    At each origin i in [test_start, test_end): fit on all rows whose target
-    is fully observable at close i (i.e. rows [0, i - h + 1)), predict X[i].
-    """
+    ``refit="monthly"`` (default): re-fit at each month start, reuse that
+    model for every day of the month (matches LSTM's cadence).
+    ``refit="step"``: refit at every origin (legacy behaviour, kept for the
+    parity experiment against SARIMAX/Prophet)."""
     hparams = hparams or _load_best_hparams(horizon)
     params  = {**BASE_PARAMS, **hparams}
 
@@ -268,25 +285,38 @@ def run(horizon=1, hparams=None, max_test_days=None, verbose=True, _data=None):
     if max_test_days is not None:
         test_end = min(test_end, test_start + max_test_days)
 
-    print(f"\n[XGBoost] {horizon}-day walk-forward (direct, daily refit)")
+    refit_positions = (set(range(test_start, test_end)) if refit == "step"
+                       else month_start_positions(dates, test_start, test_end))
+
+    print(f"\n[XGBoost] {horizon}-day walk-forward (direct, {refit} refit)")
     print(f"  Hparams: {hparams}")
     print(f"  Train : {dates[0].date()} .. {dates[test_start-1].date()}  ({test_start} obs)")
     print(f"  Test  : {dates[test_start].date()} .. {dates[test_end-1].date()}  ({test_end-test_start} obs)")
+    print(f"  Refits: {len(refit_positions)}")
 
-    rows = []
-    for i in range(test_start, test_end):
-        train_end = i - horizon + 1
-        if train_end <= 0:
-            continue
-        X_tr, y_tr = X[:train_end], y[:train_end]
-        model = _fit_es(X_tr, y_tr, params)
-        y_pred = float(model.predict(X[i:i + 1])[0])
-        rows.append((dates[i], float(y[i]), y_pred))
-        if verbose and (i - test_start) % 100 == 0:
-            print(f"    {dates[i].date()}  n_train={train_end}  y_pred={y_pred:+.5f}  y_true={y[i]:+.5f}")
+    rows: list = []
+    model: xgb.XGBRegressor | None = None
+    with measure("xgboost", horizon, "test", refit=refit,
+                 n_predictions_fn=lambda: len(rows)):
+        for i in range(test_start, test_end):
+            if i in refit_positions:
+                train_end = i - horizon + 1
+                if train_end <= 0:
+                    continue
+                X_tr, y_tr = X[:train_end], y[:train_end]
+                model = _fit_es(X_tr, y_tr, params)
+                if verbose:
+                    print(f"    [refit {dates[i].date()}] train_end={train_end}")
+            if model is None:
+                continue
+            y_pred = float(model.predict(X[i:i + 1])[0])
+            rows.append((dates[i], float(y[i]), y_pred))
 
     preds = pd.DataFrame(rows, columns=["date", "y_true", "y_pred"]).set_index("date")
-    train_drift = float(y[:test_start].mean())
+    # y is target_log_return_{h}d (cumulative h-day return), so y.mean() is
+    # already h * mu_daily. summary() multiplies by horizon again, so divide
+    # here to recover the daily drift and keep the predict-drift baseline honest.
+    train_drift = float(y[:test_start].mean()) / horizon
     m = summary(preds["y_true"].to_numpy(), preds["y_pred"].to_numpy(),
                 drift=train_drift, horizon=horizon)
     print(f"  Results: n={m['n']}  "
@@ -300,15 +330,19 @@ def run(horizon=1, hparams=None, max_test_days=None, verbose=True, _data=None):
     return preds, m
 
 
-def run_all(horizons=None, hparams_by_h=None, max_test_days=None):
+def run_all(horizons=None, hparams_by_h=None, refit="monthly",
+            max_test_days=None, verbose=True):
     """Test walk-forward for every horizon. hparams_by_h may pin per-horizon
-    combos; otherwise the CV file is consulted (falling back to defaults)."""
+    combos; otherwise the CV file is consulted (falling back to defaults).
+    ``verbose=False`` suppresses the per-refit progress lines."""
     horizons = horizons or HORIZONS
-    print(f"\n[XGBoost] multi-horizon test walk-forward (horizons={horizons})")
+    print(f"\n[XGBoost] multi-horizon test walk-forward "
+          f"(refit={refit}, horizons={horizons})")
     results = {}
     for h in horizons:
         hp = None if hparams_by_h is None else hparams_by_h.get(h)
-        _, m = run(horizon=h, hparams=hp, max_test_days=max_test_days)
+        _, m = run(horizon=h, hparams=hp, refit=refit,
+                   max_test_days=max_test_days, verbose=verbose)
         results[h] = m
 
     print(f"\n{'='*72}\n  XGBoost summary\n{'='*72}")
@@ -329,11 +363,13 @@ if __name__ == "__main__":
                     help="run Round-1 grid search instead of the test walk-forward")
     ap.add_argument("--max-val-days", type=int, default=None,
                     help="limit each CV fold's val length for a quick smoke run")
+    ap.add_argument("--refit", choices=["monthly", "step"], default="monthly",
+                    help="test refit cadence: monthly (default) or step (every origin)")
     args = ap.parse_args()
     if args.cv:
         horizons = None if args.horizon is None else [args.horizon]
         run_cv(horizons=horizons, max_val_days=args.max_val_days)
     elif args.horizon is None:
-        run_all(max_test_days=args.max_test_days)
+        run_all(refit=args.refit, max_test_days=args.max_test_days)
     else:
-        run(horizon=args.horizon, max_test_days=args.max_test_days)
+        run(horizon=args.horizon, refit=args.refit, max_test_days=args.max_test_days)

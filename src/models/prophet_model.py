@@ -58,6 +58,8 @@ from prophet import Prophet
 from src.config import TRAIN_START, TEST_START, TEST_END, HORIZONS, TRAIN_WINDOW
 from src.evaluation.cv import DEFAULT_VAL_YEARS, aggregate_metrics, year_folds
 from src.evaluation.metrics import summary
+from src.evaluation.runtime import record
+import time
 from src.evaluation.walk_forward import (expanding_walk_forward,
                                          expanding_walk_forward_multi_horizon,
                                          month_start_positions)
@@ -254,10 +256,14 @@ def run_all(horizons=None, growth="flat", refit="step",
     refit_positions = (set(range(test_start, test_end)) if refit == "step"
                        else month_start_positions(dates, test_start, test_end))
 
+    t0 = time.time()
     all_preds = expanding_walk_forward_multi_horizon(
         y, X, dates, test_start, model, refit_positions,
         horizons=horizons, test_end=test_end, train_window=train_window,
     )
+    n_pred_total = sum(len(df) for df in all_preds.values())
+    record("prophet", -1, "test", time.time() - t0,
+           refit=refit, n_predictions=n_pred_total)
 
     train_drift = float(y[:test_start].mean())
     results = {}
@@ -303,6 +309,7 @@ def run_cv(horizons=None, growth="flat", refit="step",
     cv_dir.mkdir(parents=True, exist_ok=True)
 
     per_fold: dict[int, dict[int, dict]] = {h: {} for h in horizons}
+    t0 = time.time()
 
     for f in folds:
         print(f"\n  --- Fold val={f.val_year}: "
@@ -331,11 +338,16 @@ def run_cv(horizons=None, growth="flat", refit="step",
                   f"RMSE={m['rmse']:.5f} (zero {m['rmse_zero']:.5f}, drift {m['rmse_drift']:.5f})  "
                   f"MAE={m['mae']:.5f}  DA={m['da']:.3f} (edge {m['da_edge']:+.3f})")
 
+    dt = time.time() - t0
     print(f"\n{'='*72}\n  Prophet CV summary  (mean +/- std across {len(folds)} folds)"
           f"\n{'='*72}")
     agg = {}
+    n_pred_total = 0
     for h in horizons:
         agg[h] = aggregate_metrics(per_fold[h])
+        n_pred_total += int(agg[h]["n_total"])
+    record("prophet", -1, "cv", dt, refit=refit, n_predictions=n_pred_total)
+    for h in horizons:
         m = agg[h]
         print(f"    h={h:>2}d   "
               f"RMSE {m['rmse']:.5f} +/- {m['rmse_std']:.5f}   "
