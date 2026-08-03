@@ -51,6 +51,19 @@ directional edge at h=1 (attributable to ETH co-movement); all longer-horizon
 edges are ≈ 0. Prophet degrades relative to SARIMAX as the horizon grows. These
 set the bar the ML models (XGBoost, LSTM) must clear to add value.
 
+### EDA figures (`reports/figures/`)
+
+Input-data analysis, independent of the models (regenerate with `--eda`).
+
+| # | Figure | Reads |
+|---|---|---|
+| 01 | BTC price history with bull/bear regimes | input data |
+| 02 | Asset correlation heatmap of log-returns | input data |
+| 03 | BTC log-return distribution vs Normal | input data |
+| 04 | Price level vs log-returns (stationarity) | input data |
+| 05 | Log volume ratio vs price movements | input data |
+| 06 | ACF and PACF of BTC log-returns | input data |
+
 ### Result figures (`reports/figures/`)
 
 | # | Figure | Reads |
