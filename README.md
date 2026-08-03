@@ -96,8 +96,8 @@ errors are correlated at **0.85–0.98**, so there is almost no idiosyncratic
 error to diversify away. Minimum-variance collapses to equal weights at short
 horizons (near-identical, near-perfectly-correlated forecasts) and concentrates
 on SARIMAX at h=30. In an **augmented pool** where the `predict-drift` baseline
-is allowed to compete, the optimum keeps drift as ~half the allocation
-(54% SARIMAX / 46% drift at h=30) — the cleanest possible statement that the
+is allowed to compete, the optimum keeps drift as half the allocation
+(≈50% SARIMAX / ≈50% drift at h=30) — the cleanest possible statement that the
 trained models carry no exploitable signal beyond the naive constant. Written to
 `reports/metrics/ensemble_*` and figures 15–16.
 
@@ -218,7 +218,7 @@ The train/test cut is set at end-2023 so the test period includes the April 2024
 **RMSE and MAE** measure forecast magnitude error. Both are reported against two honest baselines:
 
 - `predict-zero` — always forecast zero return (random walk without drift).
-- `predict-drift` — always forecast `h × drift_train`, where `drift_train` is the mean daily log-return on the training set (random walk with drift). This is the harder and more honest bar: a model that merely captures BTC's upward trend will match it but add no conditional information.
+- `predict-drift` — forecast `h × drift_t`, where `drift_t` is the mean daily log-return over **every observation up to the forecast origin `t`** (random walk with drift). This is an *expanding walk-forward* estimate: it uses no future data and grows with the fit window exactly like the models it benchmarks (rather than a single constant frozen at the train/test boundary). It is the harder, more honest bar — a model that merely captures BTC's upward trend will match it but add no conditional information.
 
 **DA (Directional Accuracy)** measures the share of origins where the predicted sign matches the realised sign. Reported alongside:
 

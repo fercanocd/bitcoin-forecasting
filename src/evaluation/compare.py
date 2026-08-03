@@ -80,24 +80,31 @@ def _log_returns() -> pd.Series:
     return df["log_return"]
 
 
-def test_drift() -> float:
-    """Mean daily log-return over the training window [TRAIN_START, TEST_START).
+def _drift_curve() -> pd.Series:
+    """Expanding mean of daily BTC log-returns from TRAIN_START, indexed by date.
 
-    This is the ``predict-drift`` baseline for the test period: it uses only
-    pre-test data, so it never leaks. Identical for every model."""
-    r = _log_returns()
-    train = r.loc[(r.index >= pd.Timestamp(TRAIN_START)) &
-                  (r.index < pd.Timestamp(TEST_START))]
-    return float(train.mean())
+    The value at date ``t`` is the random-walk-with-drift rate estimated from
+    every return up to and including ``t``. Read at a walk-forward origin it uses
+    only data available at that origin's close, so it never leaks -- and, unlike
+    a single train-window constant, it grows with the fit window exactly like the
+    models it is benchmarked against (daily-refit SARIMAX/Prophet expand into the
+    test and CV validation years; the drift baseline now expands with them)."""
+    r = _log_returns().sort_index()
+    r = r.loc[r.index >= pd.Timestamp(TRAIN_START)]
+    return r.expanding().mean()
 
 
-def fold_drift(val_year: int) -> float:
-    """Mean daily log-return over [TRAIN_START, Jan 1 of val_year) -- the
-    predict-drift baseline for one CV fold, using that fold's train only."""
-    r = _log_returns()
-    train = r.loc[(r.index >= pd.Timestamp(TRAIN_START)) &
-                  (r.index < pd.Timestamp(f"{val_year}-01-01"))]
-    return float(train.mean())
+def drift_at(origin_dates) -> np.ndarray:
+    """Per-origin predict-drift rate for the given origin-close dates.
+
+    Aligns the expanding drift curve onto each origin (forward-filling so a
+    non-trading origin inherits the last known rate). Multiply by the horizon to
+    get the predict-drift forecast. This is the walk-forward ``predict-drift``
+    baseline used for every reported table -- test and CV alike -- replacing the
+    old frozen train-window constant."""
+    curve = _drift_curve()
+    idx = pd.DatetimeIndex(pd.to_datetime(list(origin_dates)))
+    return curve.reindex(idx, method="ffill").to_numpy()
 
 
 # ---------------------------------------------------------------------------
@@ -140,26 +147,28 @@ def load_cv_folds(model: str, horizon: int) -> dict[int, pd.DataFrame]:
 # Metric rows
 # ---------------------------------------------------------------------------
 
-def test_metrics(model: str, horizon: int, drift: float | None = None) -> dict | None:
-    """Full metric dict for one model/horizon on the test set, or None if absent."""
+def test_metrics(model: str, horizon: int) -> dict | None:
+    """Full metric dict for one model/horizon on the test set, or None if absent.
+
+    The predict-drift baseline is the per-origin walk-forward drift aligned to
+    this model's own origin dates (see ``drift_at``)."""
     df = load_test(model, horizon)
     if df is None or df.empty:
         return None
-    drift = test_drift() if drift is None else drift
     return summary(df["y_true"].to_numpy(), df["y_pred"].to_numpy(),
-                   drift=drift, horizon=horizon)
+                   drift=drift_at(df.index), horizon=horizon)
 
 
 def validation_metrics(model: str, horizon: int) -> dict | None:
-    """CV metrics for one model/horizon: score each fold with its own train
-    drift, then aggregate mean +/- std across folds (matches how the model
-    files build their Round-1 numbers). None if no folds are present."""
+    """CV metrics for one model/horizon: score each fold against the per-origin
+    walk-forward drift, then aggregate mean +/- std across folds. None if no
+    folds are present."""
     folds = load_cv_folds(model, horizon)
     if not folds:
         return None
     per_fold = {
         year: summary(df["y_true"].to_numpy(), df["y_pred"].to_numpy(),
-                      drift=fold_drift(year), horizon=horizon)
+                      drift=drift_at(df.index), horizon=horizon)
         for year, df in folds.items()
     }
     return aggregate_metrics(per_fold)
@@ -200,12 +209,11 @@ _TEST_COLS = ["model", "horizon", "n", "rmse", "rmse_zero", "rmse_drift",
 def build_test_table(horizons=None) -> pd.DataFrame:
     """One row per available model/horizon on the test set."""
     horizons  = horizons or HORIZONS
-    drift     = test_drift()
     runtimes  = runtime.load()
     rows = []
     for model in MODELS:
         for h in horizons:
-            m = test_metrics(model, h, drift=drift)
+            m = test_metrics(model, h)
             if m is None:
                 continue
             row = {"model": DISPLAY[model], "horizon": h,

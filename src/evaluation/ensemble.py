@@ -113,15 +113,16 @@ def _align(series: dict[str, pd.DataFrame], tol: float = 1e-6
 def test_panel(horizon: int, augment: bool = False
                ) -> tuple[pd.DataFrame, list[str]]:
     """Aligned test panel for one horizon (origins where every model predicts).
-    With ``augment`` the predict-drift baseline joins the pool as a constant
-    forecast h * test_drift() sharing the models' index and y_true."""
+    With ``augment`` the predict-drift baseline joins the pool as the per-origin
+    walk-forward forecast h * drift_at(origin) sharing the models' index and
+    y_true."""
     series = {m: compare.load_test(m, horizon) for m in compare.MODELS}
     if augment:
         template = next((series[m] for m in compare.MODELS
                          if series[m] is not None and not series[m].empty), None)
         if template is not None:
             d = template.copy()
-            d["y_pred"] = horizon * compare.test_drift()
+            d["y_pred"] = horizon * compare.drift_at(d.index)
             series[DRIFT] = d
     return _align(series)
 
@@ -131,7 +132,8 @@ def val_panel(horizon: int, augment: bool = False
     """Aligned validation panel for one horizon: each model's CV folds are
     concatenated across years (2020-2023) before aligning, so the weights see
     the full four-fold validation history. With ``augment`` the predict-drift
-    baseline joins the pool, using each fold's own train drift (fold_drift)."""
+    baseline joins the pool as the per-origin walk-forward drift (drift_at),
+    matching how the recursive models expand into each validation year."""
     series: dict[str, pd.DataFrame] = {}
     template_folds: dict[int, pd.DataFrame] | None = None
     for m in compare.MODELS:
@@ -144,7 +146,7 @@ def val_panel(horizon: int, augment: bool = False
         parts = []
         for year, df in template_folds.items():
             d = df.copy()
-            d["y_pred"] = horizon * compare.fold_drift(year)
+            d["y_pred"] = horizon * compare.drift_at(d.index)
             parts.append(d)
         series[DRIFT] = pd.concat(parts).sort_index()
     return _align(series)
@@ -239,7 +241,6 @@ def build_test_table(horizons=None, augment: bool = False) -> pd.DataFrame:
 
     The weights come from validation; the test columns never informed them."""
     horizons = horizons or HORIZONS
-    drift = compare.test_drift()
     rows = []
     for h in horizons:
         vpanel, vmodels = val_panel(h, augment=augment)
@@ -253,6 +254,7 @@ def build_test_table(horizons=None, augment: bool = False) -> pd.DataFrame:
 
         yt_test = tpanel["y_true"].to_numpy()
         yt_val  = vpanel["y_true"].to_numpy()
+        drift   = compare.drift_at(tpanel.index)   # per-origin walk-forward drift
         base = summary(yt_test, np.zeros_like(yt_test), drift=drift, horizon=h)
         zero_test, drift_test = base["rmse_zero"], base["rmse_drift"]
 
