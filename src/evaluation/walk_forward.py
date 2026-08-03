@@ -36,7 +36,8 @@ import pandas as pd
 
 
 class WalkForwardModel(Protocol):
-    def fit(self, y_hist: np.ndarray, X_hist: np.ndarray | None) -> None: ...
+    def fit(self, y_hist: np.ndarray, X_hist: np.ndarray | None,
+            t0: int = 0) -> None: ...
     def forecast(self, horizon: int, X_next: np.ndarray | None) -> float: ...
     def observe(self, y_obs: np.ndarray, X_obs: np.ndarray | None) -> None: ...
 
@@ -60,6 +61,7 @@ def expanding_walk_forward_multi_horizon(
     refit_positions: set[int],
     horizons: list[int],
     test_end: int | None = None,
+    train_window: int | None = None,
     verbose: bool = True,
 ) -> dict[int, pd.DataFrame]:
     """Walk-forward loop that fits once per origin and scores all horizons jointly.
@@ -69,6 +71,10 @@ def expanding_walk_forward_multi_horizon(
     and triples the compute cost for no benefit. At each origin the model is
     fit once, then forecast(h) is called for every h in horizons before
     observe() advances the state by one day.
+
+    train_window : None => expanding window (fit on all history y[:i]);
+                   an int W => rolling window (fit on the last W observations
+                   y[i-W:i]), so coefficients track the recent regime.
 
     For each horizon h, only origins where y[i:i+h] is fully observed are
     scored (the last h-1 origins cannot be evaluated for that horizon).
@@ -82,7 +88,8 @@ def expanding_walk_forward_multi_horizon(
 
     for i in range(test_start, test_end):
         if i in refit_positions:
-            model.fit(y[:i], None if X is None else X[:i])
+            lo = 0 if train_window is None else max(0, i - train_window)
+            model.fit(y[lo:i], None if X is None else X[lo:i], t0=lo)
             n_refits += 1
         X_next = None if X is None else X[i:i + 1]
         for h in horizons:
@@ -113,6 +120,7 @@ def expanding_walk_forward(
     refit_positions: set[int],
     horizon: int = 1,
     test_end: int | None = None,
+    train_window: int | None = None,
     verbose: bool = True,
 ) -> pd.DataFrame:
     """Run the walk-forward loop over positions [test_start, eval_end).
@@ -129,6 +137,8 @@ def expanding_walk_forward(
     test_end        : one past the last realised position to consider
                       (default len(y)); the effective end is capped so that
                       y[i:i+h] is always fully observed.
+    train_window    : None => expanding window (fit on all history y[:i]);
+                      an int W => rolling window (fit on y[i-W:i]).
 
     Returns a DataFrame indexed by date with columns y_true, y_pred, where the
     date is the first day of the realised window.
@@ -139,7 +149,8 @@ def expanding_walk_forward(
     rows, n_refits = [], 0
     for i in range(test_start, eval_end):
         if i in refit_positions:
-            model.fit(y[:i], None if X is None else X[:i])
+            lo = 0 if train_window is None else max(0, i - train_window)
+            model.fit(y[lo:i], None if X is None else X[lo:i], t0=lo)
             n_refits += 1
         X_next = None if X is None else X[i:i + 1]
         y_pred = model.forecast(horizon, X_next)

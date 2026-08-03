@@ -121,36 +121,58 @@ def diebold_mariano(y_true, y_pred_1, y_pred_2, loss: str = "squared",
             "mean_diff": d_bar, "lag": lag}
 
 
-def summary(y_true, y_pred, drift: float | None = None, horizon: int = 1) -> dict:
+def summary(y_true, y_pred, drift=None, horizon: int = 1) -> dict:
     """All metrics in one dict, with baselines for context.
 
     Baselines for RMSE / MAE:
       predict-zero  -- always forecast 0 (random walk without drift).
-      predict-drift -- always forecast horizon * drift (random walk with drift).
-                       Only included when drift is provided. drift should be the
-                       daily mean log-return estimated on the training set
-                       (never on the test set, to avoid leakage).
+      predict-drift -- forecast horizon * drift (random walk with drift). Only
+                       included when drift is provided.
+
+                       ``drift`` may be a scalar (one rate applied to every
+                       origin) or a 1-D array aligned to ``y_true`` (the drift
+                       rate known at each walk-forward origin). The array form is
+                       the honest baseline: at each origin the rate is re-estimated
+                       from every return available up to that point, so it expands
+                       with the fit window exactly like the models it benchmarks
+                       and never uses future data.
 
     Baseline for DA:
       always-up     -- the share of positive realisations; da_edge = da - da_up
                        is the conditional directional skill over the drift.
     """
-    y_true, y_pred = _clean(y_true, y_pred)
-    zero = np.zeros_like(y_true)
-    da    = directional_accuracy(y_true, y_pred)
-    da_up = always_up_da(y_true)
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    finite = np.isfinite(y_true) & np.isfinite(y_pred)
+
+    drift_pred = None
+    if drift is not None:
+        d = np.asarray(drift, dtype=float)
+        if d.ndim == 0:
+            drift_pred = np.full(y_true.shape, horizon * float(d))
+        else:
+            if d.shape != y_true.shape:
+                raise ValueError(
+                    f"drift array {d.shape} does not match y_true {y_true.shape}")
+            drift_pred = horizon * d
+        finite &= np.isfinite(drift_pred)
+
+    yt, yp = y_true[finite], y_pred[finite]
+    zero = np.zeros_like(yt)
+    da    = directional_accuracy(yt, yp)
+    da_up = always_up_da(yt)
     out = {
-        "n": int(y_true.size),
-        "rmse": rmse(y_true, y_pred),
-        "mae": mae(y_true, y_pred),
+        "n": int(yt.size),
+        "rmse": rmse(yt, yp),
+        "mae": mae(yt, yp),
         "da": da,
         "da_up": da_up,
         "da_edge": da - da_up,
-        "rmse_zero": rmse(y_true, zero),
-        "mae_zero": mae(y_true, zero),
+        "rmse_zero": rmse(yt, zero),
+        "mae_zero": mae(yt, zero),
     }
-    if drift is not None:
-        drift_pred = np.full_like(y_true, horizon * drift)
-        out["rmse_drift"] = rmse(y_true, drift_pred)
-        out["mae_drift"]  = mae(y_true, drift_pred)
+    if drift_pred is not None:
+        dp = drift_pred[finite]
+        out["rmse_drift"] = rmse(yt, dp)
+        out["mae_drift"]  = mae(yt, dp)
     return out

@@ -55,8 +55,11 @@ import numpy as np
 import pandas as pd
 from prophet import Prophet
 
-from src.config import TEST_START, TEST_END, HORIZONS
+from src.config import TRAIN_START, TEST_START, TEST_END, HORIZONS, TRAIN_WINDOW
+from src.evaluation.cv import DEFAULT_VAL_YEARS, aggregate_metrics, year_folds
 from src.evaluation.metrics import summary
+from src.evaluation.runtime import record
+import time
 from src.evaluation.walk_forward import (expanding_walk_forward,
                                          expanding_walk_forward_multi_horizon,
                                          month_start_positions)
@@ -120,7 +123,7 @@ class ProphetModel:
             uncertainty_samples=0,            # point forecast only -> much faster
         )
         self.m = None
-        self._n_train = 0                     # rows seen at last fit == origin pos
+        self._n_train = 0                     # absolute origin position at last fit
         self._n_seen = 0                      # observes since last fit (monthly)
 
     def _new_model(self) -> Prophet:
@@ -129,16 +132,21 @@ class ProphetModel:
             m.add_regressor(col)              # additive, standardised (auto)
         return m
 
-    def fit(self, y_hist, X_hist):
+    def fit(self, y_hist, X_hist, t0=0):
+        # t0 is the absolute position of the first row of y_hist in the full
+        # series. With an expanding window t0=0 and len(y_hist)==origin; with a
+        # rolling window t0>0, so we must slice the real calendar dates
+        # [t0 : t0+n] (weekly/yearly seasonality is date-dependent) and record
+        # the absolute origin position t0+n for forecast().
         n = len(y_hist)
-        train = pd.DataFrame({"ds": self._dates[:n],
+        train = pd.DataFrame({"ds": self._dates[t0:t0 + n],
                               "y": np.asarray(y_hist, dtype=float)})
         if X_hist is not None:
             for j, col in enumerate(self._regressors):
                 train[col] = np.asarray(X_hist, dtype=float)[:, j]
         self.m = self._new_model()
         self.m.fit(train)
-        self._n_train = n
+        self._n_train = t0 + n                # absolute origin position
         self._n_seen = 0
 
     def forecast(self, horizon, X_next):
@@ -166,8 +174,8 @@ class ProphetModel:
         self._n_seen += 1
 
 
-def run(horizon=1, growth="flat", refit="step", max_test_days=None,
-        verbose=True, _data=None):
+def run(horizon=1, growth="flat", refit="step", train_window=TRAIN_WINDOW,
+        max_test_days=None, verbose=True, _data=None):
     print(f"\n[Prophet] {horizon}-day-ahead walk-forward "
           f"(growth={growth}, refit={refit}, lag-1 regressors)")
     dates, endog, exog = _data if _data is not None else load_data()
@@ -181,7 +189,8 @@ def run(horizon=1, growth="flat", refit="step", max_test_days=None,
     if max_test_days is not None:
         test_end = min(test_end, test_start + max_test_days)
 
-    print(f"  Train: {dates[0].date()} .. {dates[test_start-1].date()}  ({test_start} obs)")
+    win = "expanding" if train_window is None else f"rolling {train_window}d"
+    print(f"  Train: {dates[0].date()} .. {dates[test_start-1].date()}  ({test_start} obs, {win})")
     print(f"  Test : {dates[test_start].date()} .. {dates[test_end-1].date()}  ({test_end-test_start} obs)")
 
     model = ProphetModel(dates, REGRESSOR_COLS, growth=growth)
@@ -192,7 +201,8 @@ def run(horizon=1, growth="flat", refit="step", max_test_days=None,
 
     preds = expanding_walk_forward(
         y, X, dates, test_start, model, refit_positions,
-        horizon=horizon, test_end=test_end, verbose=verbose,
+        horizon=horizon, test_end=test_end, train_window=train_window,
+        verbose=verbose,
     )
 
     train_drift = float(y[:test_start].mean())
@@ -210,17 +220,23 @@ def run(horizon=1, growth="flat", refit="step", max_test_days=None,
     return preds, m
 
 
-def run_all(horizons=None, growth="flat", refit="step", max_test_days=None):
+def run_all(horizons=None, growth="flat", refit="step",
+            train_window=TRAIN_WINDOW, max_test_days=None):
     """Run all horizons with a SINGLE walk-forward: one fit per origin, all horizons jointly.
 
     This is the conceptually correct approach for a recursive model: the daily
     Prophet model is identical regardless of the forecast horizon -- only the
     number of steps summed at the end differs. Fitting once per origin (instead
     of once per origin per horizon) cuts compute cost by len(horizons)x.
+
+    train_window mirrors SARIMAX: None => expanding window; an int W => the
+    model is refit on the last W days at each origin, so both baselines are
+    evaluated under identical rolling-window conditions (see config.TRAIN_WINDOW).
     """
     horizons = horizons or HORIZONS
+    win = "expanding" if train_window is None else f"rolling {train_window}d"
     print(f"\n[Prophet] multi-horizon walk-forward "
-          f"(growth={growth}, refit={refit}, horizons={horizons}, lag-1 regressors)")
+          f"(growth={growth}, refit={refit}, window={win}, horizons={horizons}, lag-1 regressors)")
 
     dates, endog, exog = load_data()
     y = endog.to_numpy(dtype=float)
@@ -233,17 +249,21 @@ def run_all(horizons=None, growth="flat", refit="step", max_test_days=None):
     if max_test_days is not None:
         test_end = min(test_end, test_start + max_test_days)
 
-    print(f"  Train: {dates[0].date()} .. {dates[test_start-1].date()}  ({test_start} obs)")
+    print(f"  Train: {dates[0].date()} .. {dates[test_start-1].date()}  ({test_start} obs, {win})")
     print(f"  Test : {dates[test_start].date()} .. {dates[test_end-1].date()}  ({test_end-test_start} obs)")
 
     model = ProphetModel(dates, REGRESSOR_COLS, growth=growth)
     refit_positions = (set(range(test_start, test_end)) if refit == "step"
                        else month_start_positions(dates, test_start, test_end))
 
+    t0 = time.time()
     all_preds = expanding_walk_forward_multi_horizon(
         y, X, dates, test_start, model, refit_positions,
-        horizons=horizons, test_end=test_end,
+        horizons=horizons, test_end=test_end, train_window=train_window,
     )
+    n_pred_total = sum(len(df) for df in all_preds.values())
+    record("prophet", -1, "test", time.time() - t0,
+           refit=refit, n_predictions=n_pred_total)
 
     train_drift = float(y[:test_start].mean())
     results = {}
@@ -264,6 +284,80 @@ def run_all(horizons=None, growth="flat", refit="step", max_test_days=None):
     return results
 
 
+def run_cv(horizons=None, growth="flat", refit="step",
+           train_window=TRAIN_WINDOW, val_years=None, max_val_days=None):
+    """Round 1: expanding-window CV over calendar years within dev.
+
+    Same fold definition as SARIMAX (see src.evaluation.cv) so the two
+    baselines produce strictly comparable Round-1 validation metrics. Prophet
+    has no structure selection step, so every fold uses the same specification
+    -- only the (auto-selected) trend, seasonality and regressor coefficients
+    change across folds as more data becomes available.
+    """
+    horizons = horizons or HORIZONS
+    val_years = val_years or DEFAULT_VAL_YEARS
+    win = "expanding" if train_window is None else f"rolling {train_window}d"
+    print(f"\n[Prophet] CV ({len(val_years)} folds: val={val_years}) "
+          f"(growth={growth}, refit={refit}, window={win}, horizons={horizons})")
+
+    dates, endog, exog = load_data()
+    y = endog.to_numpy(dtype=float)
+    X = exog.to_numpy(dtype=float)
+    folds = year_folds(dates, val_years=val_years, train_start_date=TRAIN_START)
+
+    cv_dir = RESULTS_DIR / "cv"
+    cv_dir.mkdir(parents=True, exist_ok=True)
+
+    per_fold: dict[int, dict[int, dict]] = {h: {} for h in horizons}
+    t0 = time.time()
+
+    for f in folds:
+        print(f"\n  --- Fold val={f.val_year}: "
+              f"train {dates[f.train_start].date()}..{dates[f.train_end-1].date()} "
+              f"({f.n_train} obs), val {dates[f.val_start].date()}..{dates[f.val_end-1].date()} "
+              f"({f.n_val} obs) ---")
+
+        val_end = (min(f.val_end, f.val_start + max_val_days)
+                   if max_val_days is not None else f.val_end)
+        model = ProphetModel(dates, REGRESSOR_COLS, growth=growth)
+        refit_positions = (set(range(f.val_start, val_end)) if refit == "step"
+                           else month_start_positions(dates, f.val_start, val_end))
+
+        all_preds = expanding_walk_forward_multi_horizon(
+            y, X, dates, f.val_start, model, refit_positions,
+            horizons=horizons, test_end=val_end, train_window=train_window,
+        )
+
+        fold_drift = float(y[f.train_start:f.train_end].mean())
+        for h, preds in all_preds.items():
+            m = summary(preds["y_true"].to_numpy(), preds["y_pred"].to_numpy(),
+                        drift=fold_drift, horizon=h)
+            per_fold[h][f.val_year] = m
+            preds.to_csv(cv_dir / f"prophet_fold{f.val_year}_{h}d.csv")
+            print(f"    h={h:>2}d   n={m['n']}  "
+                  f"RMSE={m['rmse']:.5f} (zero {m['rmse_zero']:.5f}, drift {m['rmse_drift']:.5f})  "
+                  f"MAE={m['mae']:.5f}  DA={m['da']:.3f} (edge {m['da_edge']:+.3f})")
+
+    dt = time.time() - t0
+    print(f"\n{'='*72}\n  Prophet CV summary  (mean +/- std across {len(folds)} folds)"
+          f"\n{'='*72}")
+    agg = {}
+    n_pred_total = 0
+    for h in horizons:
+        agg[h] = aggregate_metrics(per_fold[h])
+        n_pred_total += int(agg[h]["n_total"])
+    record("prophet", -1, "cv", dt, refit=refit, n_predictions=n_pred_total)
+    for h in horizons:
+        m = agg[h]
+        print(f"    h={h:>2}d   "
+              f"RMSE {m['rmse']:.5f} +/- {m['rmse_std']:.5f}   "
+              f"MAE {m['mae']:.5f} +/- {m['mae_std']:.5f}   "
+              f"DA {m['da']:.3f} +/- {m['da_std']:.3f}   "
+              f"edge {m['da_edge']:+.3f} +/- {m['da_edge_std']:.3f}   "
+              f"n_total={m['n_total']}")
+    return agg, per_fold
+
+
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser(description="Prophet multi-horizon walk-forward")
@@ -275,8 +369,14 @@ if __name__ == "__main__":
                     help="refit every origin (default, comparable to SARIMAX) or monthly (fast dev)")
     ap.add_argument("--max-test-days", type=int, default=None,
                     help="limit the test horizon for a quick smoke run")
+    ap.add_argument("--cv", action="store_true",
+                    help="run Round-1 cross-validation instead of the test walk-forward")
+    ap.add_argument("--max-val-days", type=int, default=None,
+                    help="limit each CV fold's val length for a quick smoke run")
     args = ap.parse_args()
-    if args.horizon is None:
+    if args.cv:
+        run_cv(growth=args.growth, refit=args.refit, max_val_days=args.max_val_days)
+    elif args.horizon is None:
         run_all(growth=args.growth, refit=args.refit, max_test_days=args.max_test_days)
     else:
         run(horizon=args.horizon, growth=args.growth, refit=args.refit,
