@@ -327,10 +327,16 @@ python -m src.models.lstm_model
 ```bash
 python -m src.evaluation.compare                    # comparison tables + DM tests
 python -m src.evaluation.ensemble                   # forecast-combination tables
-python -m src.visualization.results_plots           # result figures 07-16
+python -m src.visualization.results_plots           # result figures 07-16 (+ auto-export to thesis/figures)
 python -m src.visualization.results_plots --only 07 # a single figure
+python -m src.visualization.results_plots --export-thesis  # copy the 7 thesis-reused figures only
 python -m src.visualization.eda_plots               # EDA figures 01-06
 ```
+
+The thesis reuses 7 of the pipeline figures; `results_plots` copies them into
+`thesis/figures/` under the names `tfm.tex` expects, so the thesis always tracks
+the latest run. The other thesis figures (hand-drawn `method_*`/`eda_*` diagrams
+and the split forecast series) are authored in the LaTeX project.
 
 ---
 
