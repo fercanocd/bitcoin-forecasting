@@ -53,6 +53,7 @@ import time
 
 PROCESSED_DIR = Path(__file__).resolve().parents[2] / "data" / "processed"
 RESULTS_DIR   = Path(__file__).resolve().parents[2] / "reports" / "predictions"
+METRICS_DIR   = Path(__file__).resolve().parents[2] / "reports" / "metrics"
 
 TARGET_TEMPLATE = "target_log_return_{h}d"
 
@@ -330,6 +331,49 @@ def run(horizon=1, hparams=None, refit="monthly", max_test_days=None,
     return preds, m
 
 
+def _feature_names() -> list[str]:
+    """Feature columns in the same order load_data() returns them (Date is the
+    index and target_* columns are excluded)."""
+    cols = pd.read_csv(PROCESSED_DIR / "xgboost_features_daily.csv", nrows=1).columns
+    return [c for c in cols if not c.startswith("target_") and c != "Date"]
+
+
+def save_feature_importance(horizons=None, hparams_by_h=None):
+    """Persist XGBoost gain importance at the two protocol reference fits per
+    horizon -- development (fit on 2018-2023, purged) and test_final (fit on the
+    full 2018-2026 span, purged). This is the interpretable summary of the
+    fitted trees, saved as numbers rather than only the figure, mirroring the
+    SARIMAX coefficient report. Both fits reuse the same recipe as Figure 13
+    (early-stopping on a chronological tail, best CV hparams, gain importance)."""
+    horizons  = horizons or HORIZONS
+    feat_names = _feature_names()
+    rows = []
+    for h in horizons:
+        dates, y, X = load_data(h)
+        hparams = (hparams_by_h or {}).get(h) or _load_best_hparams(h)
+        params  = {**BASE_PARAMS, **hparams, "importance_type": "gain"}
+
+        test_start = int(dates.searchsorted(pd.Timestamp(TEST_START)))
+        test_end   = len(y)
+        if TEST_END is not None:
+            test_end = min(test_end,
+                           int(dates.searchsorted(pd.Timestamp(TEST_END), side="right")))
+
+        for phase, hi in (("development", test_start), ("test_final", test_end)):
+            train_end = hi - h                   # purge h rows (no target leakage)
+            if train_end <= 0:
+                continue
+            model = _fit_es(X[:train_end], y[:train_end], params)
+            for feat, gain in zip(feat_names, model.feature_importances_):
+                rows.append({"phase": phase, "horizon": h,
+                             "feature": feat, "gain": float(gain)})
+
+    METRICS_DIR.mkdir(parents=True, exist_ok=True)
+    out = METRICS_DIR / "xgboost_importance.csv"
+    pd.DataFrame(rows).to_csv(out, index=False)
+    print(f"  Feature importance -> {out}")
+
+
 def run_all(horizons=None, hparams_by_h=None, refit="monthly",
             max_test_days=None, verbose=True):
     """Test walk-forward for every horizon. hparams_by_h may pin per-horizon
@@ -349,6 +393,9 @@ def run_all(horizons=None, hparams_by_h=None, refit="monthly",
     for h, m in results.items():
         print(f"    h={h:>2}d   RMSE {m['rmse']:.5f} (zero {m['rmse_zero']:.5f}, drift {m['rmse_drift']:.5f})"
               f"   MAE {m['mae']:.5f}   DA {m['da']:.3f} (edge {m['da_edge']:+.3f})")
+
+    if max_test_days is None:                    # skip on smoke runs (heavy extra fits)
+        save_feature_importance(horizons, hparams_by_h)
     return results
 
 
@@ -365,8 +412,13 @@ if __name__ == "__main__":
                     help="limit each CV fold's val length for a quick smoke run")
     ap.add_argument("--refit", choices=["monthly", "step"], default="monthly",
                     help="test refit cadence: monthly (default) or step (every origin)")
+    ap.add_argument("--importance-only", action="store_true",
+                    help="regenerate the feature-importance CSV without the walk-forward")
     args = ap.parse_args()
-    if args.cv:
+    if args.importance_only:
+        horizons = None if args.horizon is None else [args.horizon]
+        save_feature_importance(horizons)
+    elif args.cv:
         horizons = None if args.horizon is None else [args.horizon]
         run_cv(horizons=horizons, max_val_days=args.max_val_days)
     elif args.horizon is None:
