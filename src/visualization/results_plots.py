@@ -24,6 +24,8 @@ Usage:
 """
 from __future__ import annotations
 
+import shutil
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -546,6 +548,49 @@ _FIGURES = {
 }
 
 
+# ---------------------------------------------------------------------------
+# Thesis figure export
+# ---------------------------------------------------------------------------
+# The thesis reuses a subset of the pipeline figures: the methodology schematic,
+# two EDA plots and the comparison/ensemble results. Copy them into
+# thesis/figures under the names tfm.txt expects, so the thesis always tracks the
+# latest pipeline run instead of being synced by hand. (The title-page logo and
+# References.bib are the only thesis assets not produced by the pipeline.)
+THESIS_FIG_DIR = FIG_DIR.parents[1] / "thesis" / "figures"
+THESIS_FIGURE_MAP = {
+    "00_method_overview.png":      "method_scheme.png",
+    "01_btc_price_history.png":    "eda_price_split.png",
+    "03_return_distribution.png":  "eda_log_returns.png",
+    "07_rmse_vs_baseline.png":     "comparison_rmse.png",
+    "08_directional_accuracy.png": "comparison_edge.png",
+    "09_predictions_timeseries.png": "results_ml_series.png",
+    "12_validation_vs_test.png":   "comparison_val_vs_test.png",
+    "13_xgboost_importance.png":   "xgb_feature_importance.png",
+    "14_diebold_mariano.png":      "comparison_dm_heatmap.png",
+    "15_ensemble_rmse.png":        "ensemble_rmse.png",
+    "16_error_correlation.png":    "ensemble_error_correlation.png",
+}
+
+
+def export_thesis_figures():
+    """Copy the pipeline figures the thesis reuses into thesis/figures under the
+    names tfm.txt expects. Sources missing on disk are skipped with a warning
+    (e.g. figure 13 when xgboost is not installed)."""
+    THESIS_FIG_DIR.mkdir(parents=True, exist_ok=True)
+    copied, missing = 0, []
+    for src_name, dst_name in THESIS_FIGURE_MAP.items():
+        src = FIG_DIR / src_name
+        if not src.exists():
+            missing.append(src_name)
+            continue
+        shutil.copy2(src, THESIS_FIG_DIR / dst_name)
+        copied += 1
+    print(f"\nExported {copied}/{len(THESIS_FIGURE_MAP)} pipeline figures "
+          f"-> {THESIS_FIG_DIR}")
+    if missing:
+        print(f"  [!] skipped (not on disk yet): {', '.join(missing)}")
+
+
 def plot_all_results():
     print("=" * 60)
     print("Generating results figures  ->  reports/figures/")
@@ -554,6 +599,7 @@ def plot_all_results():
         for fn in _FIGURES.values():
             fn()
     print(f"\nResults figures written to {FIG_DIR}")
+    export_thesis_figures()
 
 
 if __name__ == "__main__":
@@ -561,8 +607,13 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Model-results figures")
     ap.add_argument("--only", choices=sorted(_FIGURES), default=None,
                     help="render a single figure by its number (e.g. 07)")
+    ap.add_argument("--export-thesis", action="store_true",
+                    help="only copy the pipeline figures the thesis reuses into "
+                         "thesis/figures (no re-render)")
     args = ap.parse_args()
-    if args.only:
+    if args.export_thesis:
+        export_thesis_figures()
+    elif args.only:
         with plt.style.context(STYLE):
             _FIGURES[args.only]()
     else:

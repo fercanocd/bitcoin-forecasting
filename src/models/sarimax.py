@@ -65,6 +65,7 @@ import time
 
 PROCESSED_DIR = Path(__file__).resolve().parents[2] / "data" / "processed"
 RESULTS_DIR   = Path(__file__).resolve().parents[2] / "reports" / "predictions"
+METRICS_DIR   = Path(__file__).resolve().parents[2] / "reports" / "metrics"
 
 ENDOG_COL = "log_return"
 EXOG_COLS = ["log_volume_ratio", "sp500_log_return", "gold_log_return",
@@ -114,7 +115,8 @@ def select_order(y, X, p_range=(0, 1, 2), q_range=(0, 1, 2), d=0, trend="c"):
     return best_order
 
 
-def select_regressors(y, X, order, exog_cols, alpha=0.05, trend="c"):
+def select_regressors(y, X, order, exog_cols, alpha=0.05, trend="c",
+                      return_pvalues=False):
     """Backward elimination of exogenous regressors by significance.
 
     Fits the full model once on the given (training) window and keeps only the
@@ -124,21 +126,121 @@ def select_regressors(y, X, order, exog_cols, alpha=0.05, trend="c"):
     Returns the list of kept column indices into exog_cols (in original order);
     an empty list means no regressor survived and the model reduces to drift
     plus noise. statsmodels names numpy exog columns x1..xk in column order, so
-    we read each regressor's p-value by that name.
+    we read each regressor's p-value by that name. With return_pvalues=True the
+    function also returns {col: p-value} for every candidate (used to persist the
+    per-fold selection spec).
     """
     res = SARIMAX(y, exog=X, order=order, trend=trend,
                   enforce_stationarity=False, enforce_invertibility=False).fit(disp=False)
     names = list(res.param_names)
     pvals = np.asarray(res.pvalues)
-    kept = []
+    kept, pval_by_col = [], {}
     for i, col in enumerate(exog_cols):
         p = float(pvals[names.index(f"x{i + 1}")])
+        pval_by_col[col] = p
         print(f"    {col:22s} p={p:.4f}  {'KEEP' if p < alpha else 'drop'}")
         if p < alpha:
             kept.append(i)
     kept_names = [exog_cols[i] for i in kept] or ["(none)"]
     print(f"  Regressor selection (alpha={alpha}): kept {kept_names}")
-    return kept
+    return (kept, pval_by_col) if return_pvalues else kept
+
+
+# ---------------------------------------------------------------------------
+# Model-parameter reporting  (structure + fitted coefficients)
+# ---------------------------------------------------------------------------
+# The pipeline saves predictions and metrics, but the *fitted model* was never
+# persisted. SARIMAX has few, fully interpretable parameters, so we record both
+# tiers of the two-round protocol:
+#   * structure (order + kept regressors) -- selected once in Round 1;
+#   * coefficients (const, regressor betas, sigma2) -- re-estimated every refit,
+#     snapshotted at the two protocol reference points: end of development
+#     (fit on 2018-2023) and end of test (fit on the full 2018-2026 span).
+
+def _param_rows(res, phase, kept_cols):
+    """Tidy [{phase, param, coef, std_err, pvalue}] rows from a fitted result.
+
+    statsmodels labels exogenous coefficients x1..xk in the order they were
+    passed; relabel them with the kept column names so the CSV is readable.
+    """
+    label = {f"x{i + 1}": col for i, col in enumerate(kept_cols)}
+    names = list(res.param_names)
+    coefs = np.asarray(res.params,  dtype=float)
+    ses   = np.asarray(res.bse,     dtype=float)
+    pvals = np.asarray(res.pvalues, dtype=float)
+    return [{"phase": phase, "param": label.get(nm, nm),
+             "coef": float(c), "std_err": float(se), "pvalue": float(p)}
+            for nm, c, se, p in zip(names, coefs, ses, pvals)]
+
+
+def _spec_row(val_year, order, trend, keep_idx, pval_by_col):
+    """One CV-fold structure row: selected order, kept regressors, and the
+    p-value of every candidate regressor on that fold's training window."""
+    kept_cols = [EXOG_COLS[i] for i in keep_idx] if keep_idx else []
+    return {"val_year": val_year, "order": str(order), "trend": trend,
+            "regressors_kept": ",".join(kept_cols) or "(none)",
+            **{f"pval_{c}": round(pval_by_col.get(c, float("nan")), 4)
+               for c in EXOG_COLS}}
+
+
+def _save_test_report(dates, y, X_full, test_start, test_end, order, trend,
+                      keep_idx, train_window):
+    """Persist frozen structure + fitted coefficients at the two protocol
+    reference points: end of development (fit on 2018-2023) and end of test
+    (fit on the full 2018-2026 span). The structure is identical across both
+    (selected once on development); only the coefficients are re-estimated on
+    the longer window, so the two rows show whether the drift / ETH beta shifted
+    once the 2024-2026 data arrived."""
+    kept_cols = [EXOG_COLS[i] for i in keep_idx] if keep_idx else []
+
+    def _fit(hi):
+        lo = 0 if train_window is None else max(0, hi - train_window)
+        Xk = X_full[lo:hi][:, keep_idx] if keep_idx else None
+        res = SARIMAX(y[lo:hi], exog=Xk, order=order, trend=trend,
+                      enforce_stationarity=False,
+                      enforce_invertibility=False).fit(disp=False)
+        return res, lo
+
+    res_dev, lo_dev = _fit(test_start)
+    res_fin, lo_fin = _fit(test_end)
+
+    spec = pd.DataFrame([
+        {"phase": "development",
+         "start": dates[lo_dev].date(), "end": dates[test_start - 1].date(),
+         "n_obs": test_start - lo_dev, "order": str(order), "trend": trend,
+         "regressors_kept": ",".join(kept_cols) or "(none)",
+         "aic": round(float(res_dev.aic), 3)},
+        {"phase": "test_final",
+         "start": dates[lo_fin].date(), "end": dates[test_end - 1].date(),
+         "n_obs": test_end - lo_fin, "order": str(order), "trend": trend,
+         "regressors_kept": ",".join(kept_cols) or "(none)",
+         "aic": round(float(res_fin.aic), 3)},
+    ])
+    coefs = pd.DataFrame(_param_rows(res_dev, "development", kept_cols)
+                         + _param_rows(res_fin, "test_final", kept_cols))
+
+    METRICS_DIR.mkdir(parents=True, exist_ok=True)
+    spec.to_csv(METRICS_DIR / "sarimax_spec.csv", index=False)
+    coefs.to_csv(METRICS_DIR / "sarimax_coefs.csv", index=False)
+    print(f"  Model report -> {METRICS_DIR / 'sarimax_spec.csv'} | "
+          f"{METRICS_DIR / 'sarimax_coefs.csv'}")
+
+
+def _cv_spec_rows(dates, y, X, trend, select):
+    """Per-fold structure-selection rows, re-run cheaply (no walk-forward)."""
+    folds = year_folds(dates, val_years=DEFAULT_VAL_YEARS,
+                       train_start_date=TRAIN_START)
+    rows = []
+    for f in folds:
+        order = select_order(y[f.train_start:f.train_end],
+                             X[f.train_start:f.train_end], trend=trend)
+        keep_idx, pval_by_col = list(range(len(EXOG_COLS))), {}
+        if select:
+            keep_idx, pval_by_col = select_regressors(
+                y[f.train_start:f.train_end], X[f.train_start:f.train_end],
+                order, EXOG_COLS, trend=trend, return_pvalues=True)
+        rows.append(_spec_row(f.val_year, order, trend, keep_idx, pval_by_col))
+    return rows
 
 
 class SarimaxModel:
@@ -271,10 +373,12 @@ def run_all(horizons=None, trend="c", select=True, refit="step",
     print(f"  Test : {dates[test_start].date()} .. {dates[test_end-1].date()}  ({test_end-test_start} obs)")
 
     order = select_order(y[:test_start], X[:test_start], trend=trend)
+    keep_idx = list(range(len(EXOG_COLS)))
     if select:
         keep_idx = select_regressors(y[:test_start], X[:test_start], order,
                                      EXOG_COLS, trend=trend)
-        X = X[:, keep_idx] if keep_idx else None
+    X_full = X                                   # keep the unreduced design for reporting
+    X = X[:, keep_idx] if keep_idx else None
 
     model = SarimaxModel(order=order, trend=trend)
     refit_positions = (set(range(test_start, test_end)) if refit == "step"
@@ -305,6 +409,10 @@ def run_all(horizons=None, trend="c", select=True, refit="step",
         print(f"    h={h:>2}d   RMSE {m['rmse']:.5f} (zero {m['rmse_zero']:.5f}, drift {m['rmse_drift']:.5f})"
               f"   MAE {m['mae']:.5f} (zero {m['mae_zero']:.5f}, drift {m['mae_drift']:.5f})"
               f"   DA {m['da']:.3f} (up {m['da_up']:.3f}, edge {m['da_edge']:+.3f})")
+
+    if max_test_days is None:                    # skip on smoke runs (partial test)
+        _save_test_report(dates, y, X_full, test_start, test_end,
+                          order, trend, keep_idx, train_window)
     return results
 
 
@@ -341,6 +449,7 @@ def run_cv(horizons=None, trend="c", select=True, refit="step",
     cv_dir.mkdir(parents=True, exist_ok=True)
 
     per_fold: dict[int, dict[int, dict]] = {h: {} for h in horizons}
+    spec_rows: list[dict] = []
     t0 = time.time()
 
     for f in folds:
@@ -352,13 +461,13 @@ def run_cv(horizons=None, trend="c", select=True, refit="step",
         # Structure selection on the fold's TRAIN portion only (no leakage).
         order = select_order(y[f.train_start:f.train_end],
                              X_full[f.train_start:f.train_end], trend=trend)
+        keep_idx, pval_by_col = list(range(len(EXOG_COLS))), {}
         if select:
-            keep_idx = select_regressors(y[f.train_start:f.train_end],
-                                         X_full[f.train_start:f.train_end],
-                                         order, EXOG_COLS, trend=trend)
-            X = X_full[:, keep_idx] if keep_idx else None
-        else:
-            X = X_full
+            keep_idx, pval_by_col = select_regressors(
+                y[f.train_start:f.train_end], X_full[f.train_start:f.train_end],
+                order, EXOG_COLS, trend=trend, return_pvalues=True)
+        X = X_full[:, keep_idx] if keep_idx else None
+        spec_rows.append(_spec_row(f.val_year, order, trend, keep_idx, pval_by_col))
 
         val_end = (min(f.val_end, f.val_start + max_val_days)
                    if max_val_days is not None else f.val_end)
@@ -400,7 +509,41 @@ def run_cv(horizons=None, trend="c", select=True, refit="step",
               f"DA {m['da']:.3f} +/- {m['da_std']:.3f}   "
               f"edge {m['da_edge']:+.3f} +/- {m['da_edge_std']:.3f}   "
               f"n_total={m['n_total']}")
+
+    if max_val_days is None:                     # skip on smoke runs (partial val)
+        METRICS_DIR.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(spec_rows).to_csv(METRICS_DIR / "sarimax_spec_cv.csv", index=False)
+        print(f"  CV structure -> {METRICS_DIR / 'sarimax_spec_cv.csv'}")
     return agg, per_fold
+
+
+def report_only(trend="c", select=True, train_window=TRAIN_WINDOW):
+    """Regenerate the SARIMAX structure + coefficient reports without running the
+    (expensive) walk-forward. Fits only the development, test-final, and per-fold
+    models -- a handful of cheap fits -- and rewrites sarimax_spec.csv,
+    sarimax_coefs.csv and sarimax_spec_cv.csv."""
+    print("\n[SARIMAX] report-only: regenerating spec + coefficient CSVs")
+    dates, endog, exog = load_data()
+    y = endog.to_numpy(dtype=float)
+    X = exog.to_numpy(dtype=float)
+
+    test_start = int(dates.searchsorted(pd.Timestamp(TEST_START)))
+    test_end   = len(y)
+    if TEST_END is not None:
+        test_end = int(dates.searchsorted(pd.Timestamp(TEST_END), side="right"))
+
+    order = select_order(y[:test_start], X[:test_start], trend=trend)
+    keep_idx = list(range(len(EXOG_COLS)))
+    if select:
+        keep_idx = select_regressors(y[:test_start], X[:test_start], order,
+                                     EXOG_COLS, trend=trend)
+    _save_test_report(dates, y, X, test_start, test_end, order, trend,
+                      keep_idx, train_window)
+
+    spec_rows = _cv_spec_rows(dates, y, X, trend, select)
+    METRICS_DIR.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(spec_rows).to_csv(METRICS_DIR / "sarimax_spec_cv.csv", index=False)
+    print(f"  CV structure -> {METRICS_DIR / 'sarimax_spec_cv.csv'}")
 
 
 if __name__ == "__main__":
@@ -418,9 +561,13 @@ if __name__ == "__main__":
                     help="run Round-1 cross-validation instead of the test walk-forward")
     ap.add_argument("--max-val-days", type=int, default=None,
                     help="limit each CV fold's val length for a quick smoke run")
+    ap.add_argument("--report-only", action="store_true",
+                    help="regenerate structure/coefficient CSVs without the walk-forward")
     args = ap.parse_args()
     select = not args.no_select
-    if args.cv:
+    if args.report_only:
+        report_only(select=select)
+    elif args.cv:
         run_cv(select=select, refit=args.refit, max_val_days=args.max_val_days)
     elif args.horizon is None:
         run_all(select=select, refit=args.refit, max_test_days=args.max_test_days)
