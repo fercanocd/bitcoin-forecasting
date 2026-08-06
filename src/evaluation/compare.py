@@ -279,21 +279,36 @@ def build_master_table(horizons=None) -> pd.DataFrame:
 
 
 # ---------------------------------------------------------------------------
-# Diebold-Mariano: pairwise, correctly aligned on origin date
+# Diebold-Mariano: pairwise including predict-zero and predict-drift
 # ---------------------------------------------------------------------------
 
 def dm_table(horizons=None, loss: str = "squared", tol: float = 1e-6) -> pd.DataFrame:
-    """Pairwise Diebold-Mariano tests for every model pair, per horizon.
+    """Pairwise Diebold-Mariano tests for every competitor pair, per horizon.
 
-    The two series are inner-joined on the shared origin date so their y_true
-    match by construction (asserted within ``tol``). A negative statistic
-    favours the first model of the pair (lower loss); ``favoured`` names it."""
+    Competitors are the four trained models plus predict-zero and predict-drift,
+    treated as additional forecast series. The two series in each pair are
+    inner-joined on the shared origin date so their y_true match by construction
+    (asserted within ``tol``). A negative statistic favours the first competitor
+    (lower loss); ``favoured`` names it."""
     horizons = horizons or HORIZONS
+    BASELINES = {"predict-zero": "predict-zero", "predict-drift": "predict-drift"}
+    display_all = {**DISPLAY, **BASELINES}
     rows = []
     for h in horizons:
         series = {m: load_test(m, h) for m in MODELS}
         series = {m: df for m, df in series.items() if df is not None and not df.empty}
-        avail  = list(series)
+
+        # Add baseline pseudo-series aligned to the first available model's index.
+        if series:
+            ref = next(iter(series.values()))
+            d = drift_at(ref.index) * h
+            z = np.zeros(len(ref))
+            series["predict-zero"]  = pd.DataFrame(
+                {"y_true": ref["y_true"].values, "y_pred": z},  index=ref.index)
+            series["predict-drift"] = pd.DataFrame(
+                {"y_true": ref["y_true"].values, "y_pred": d},  index=ref.index)
+
+        avail = list(series)
         for i, a in enumerate(avail):
             for b in avail[i + 1:]:
                 j = series[a].join(series[b], how="inner",
@@ -305,10 +320,11 @@ def dm_table(horizons=None, loss: str = "squared", tol: float = 1e-6) -> pd.Data
                 res = diebold_mariano(j["y_true_a"].to_numpy(),
                                       j["y_pred_a"].to_numpy(),
                                       j["y_pred_b"].to_numpy(), loss=loss, h=h)
-                favoured = (DISPLAY[a] if res["dm"] < 0 else DISPLAY[b]) \
+                favoured = (display_all[a] if res["dm"] < 0 else display_all[b]) \
                     if np.isfinite(res["dm"]) else "-"
                 rows.append({
-                    "horizon": h, "model_a": DISPLAY[a], "model_b": DISPLAY[b],
+                    "horizon": h,
+                    "model_a": display_all[a], "model_b": display_all[b],
                     "dm": res["dm"], "p_value": res["p_value"], "n": res["n"],
                     "favoured": favoured,
                     "significant": bool(res["p_value"] < DM_ALPHA),
@@ -379,7 +395,7 @@ def write_reports(horizons=None, verbose=True) -> dict[str, pd.DataFrame]:
         dm_md = (dm_md.drop(columns=["y_true_aligned"])
                        .rename(columns={"significant": "signif"}))
     (METRICS_DIR / "diebold_mariano.md").write_text(
-        f"# Diebold-Mariano pairwise tests (test set, squared loss; "
+        f"# Diebold-Mariano pairwise tests incl. baselines (test set, squared loss; "
         f"signif = p<{DM_ALPHA})\n\n"
         + to_markdown(dm_md, dm_fmt) + "\n", encoding="utf-8")
 
@@ -438,7 +454,7 @@ def print_summary(master: pd.DataFrame, dm: pd.DataFrame) -> None:
             for _, r in dm[dm["horizon"] == h].iterrows():
                 signif = "yes" if r["significant"] else "no"
                 warn = "" if r["y_true_aligned"] else "  [!] y_true misaligned"
-                print(f"  {r['model_a']:>8} vs {r['model_b']:<8}  "
+                print(f"  {r['model_a']:>14} vs {r['model_b']:<14}  "
                       f"DM={r['dm']:+.3f}  p={r['p_value']:.4f}   "
                       f"signif={signif:<3}  favours {r['favoured']}{warn}")
 

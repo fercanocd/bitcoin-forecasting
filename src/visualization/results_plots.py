@@ -398,15 +398,20 @@ def plot_diebold_mariano():
                              squeeze=False)
     axes = axes[0]
 
+    BASELINE_ORDER = ["predict-zero", "predict-drift"]
+    all_order = MODEL_ORDER + BASELINE_ORDER
+
     for ax, h in zip(axes, horizons):
         sub = dm[dm["horizon"] == h]
-        models = [m for m in MODEL_ORDER
-                  if m in set(sub["model_a"]) | set(sub["model_b"])]
+        present = set(sub["model_a"]) | set(sub["model_b"])
+        models = [m for m in all_order if m in present]
         k = len(models)
         idx = {m: i for i, m in enumerate(models)}
-        stat = np.full((k, k), np.nan)
-        pmat = np.full((k, k), np.nan)
+        stat  = np.full((k, k), np.nan)
+        pmat  = np.full((k, k), np.nan)
         for _, r in sub.iterrows():
+            if r["model_a"] not in idx or r["model_b"] not in idx:
+                continue
             i, j = idx[r["model_a"]], idx[r["model_b"]]
             # Signed so a positive cell (row, col) means the ROW model has lower loss.
             stat[i, j], stat[j, i] = -r["dm"], r["dm"]
