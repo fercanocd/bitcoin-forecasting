@@ -54,6 +54,7 @@ import time
 
 PROCESSED_DIR = Path(__file__).resolve().parents[2] / "data" / "processed"
 RESULTS_DIR   = Path(__file__).resolve().parents[2] / "reports" / "predictions"
+MODELS_DIR    = Path(__file__).resolve().parents[2] / "models" / "saved"
 
 TARGET_TEMPLATE = "target_log_return_{h}d"
 SEQ_LEN         = 60
@@ -434,7 +435,47 @@ def run_all(horizons=None, hparams_by_h=None, max_test_days=None, verbose=True):
     for h, m in results.items():
         print(f"    h={h:>2}d   RMSE {m['rmse']:.5f} (zero {m['rmse_zero']:.5f}, drift {m['rmse_drift']:.5f})"
               f"   MAE {m['mae']:.5f}   DA {m['da']:.3f} (edge {m['da_edge']:+.3f})")
+
+    if max_test_days is None:
+        save_final_model(horizons=horizons, hparams_by_h=hparams_by_h)
+
     return results
+
+
+def save_final_model(horizons=None, hparams_by_h=None):
+    """Fit one LSTM per horizon on full history and persist weights + scaler."""
+    import json, pickle
+    horizons = horizons or HORIZONS
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    train_cfg = BASE_TRAIN.copy()
+
+    for h in horizons:
+        hparams = (hparams_by_h or {}).get(h) or _load_best_hparams(h)
+        dates, y, X = load_data(h)
+        n = len(y)
+        test_end = n
+        if TEST_END is not None:
+            test_end = min(n, int(dates.searchsorted(pd.Timestamp(TEST_END), side="right")))
+
+        train_end = test_end - h   # purge last h rows
+        scaler    = StandardScaler().fit(X[:train_end])
+        X_scaled  = scaler.transform(X).astype(np.float32)
+        X_tr, y_tr, _ = make_sequences(X_scaled, y, SEQ_LEN, SEQ_LEN - 1, train_end)
+        model, _, _ = _train_one(X_tr, y_tr, hparams, train_cfg)
+
+        torch.save(model.state_dict(), MODELS_DIR / f"lstm_{h}d.pt")
+        with open(MODELS_DIR / f"lstm_{h}d_scaler.pkl", "wb") as fh:
+            pickle.dump(scaler, fh)
+        meta = {
+            "horizon": h,
+            "seq_len": SEQ_LEN,
+            "input_size": X.shape[1],
+            "train_end_date": str(dates[train_end - 1].date()),
+            **hparams,
+        }
+        with open(MODELS_DIR / f"lstm_{h}d_meta.json", "w") as fh:
+            json.dump(meta, fh, indent=2)
+        print(f"  [LSTM] h={h}d saved -> {MODELS_DIR / f'lstm_{h}d.pt'}")
 
 
 if __name__ == "__main__":

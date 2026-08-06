@@ -66,6 +66,7 @@ from src.evaluation.walk_forward import (expanding_walk_forward,
 
 PROCESSED_DIR = Path(__file__).resolve().parents[2] / "data" / "processed"
 RESULTS_DIR   = Path(__file__).resolve().parents[2] / "reports" / "predictions"
+MODELS_DIR    = Path(__file__).resolve().parents[2] / "models" / "saved"
 
 ENDOG_COL      = "log_return"
 REGRESSOR_COLS = ["log_volume_ratio", "sp500_log_return", "gold_log_return",
@@ -281,6 +282,10 @@ def run_all(horizons=None, growth="flat", refit="step",
         print(f"    h={h:>2}d   RMSE {m['rmse']:.5f} (zero {m['rmse_zero']:.5f}, drift {m['rmse_drift']:.5f})"
               f"   MAE {m['mae']:.5f} (zero {m['mae_zero']:.5f}, drift {m['mae_drift']:.5f})"
               f"   DA {m['da']:.3f} (up {m['da_up']:.3f}, edge {m['da_edge']:+.3f})")
+
+    if max_test_days is None:
+        save_final_model(growth=growth)
+
     return results
 
 
@@ -356,6 +361,40 @@ def run_cv(horizons=None, growth="flat", refit="step",
               f"edge {m['da_edge']:+.3f} +/- {m['da_edge_std']:.3f}   "
               f"n_total={m['n_total']}")
     return agg, per_fold
+
+
+def save_final_model(growth="flat"):
+    """Fit Prophet on full history and pickle to models/saved/prophet_final.pkl.
+
+    Prophet is horizon-agnostic: the same daily model is used for all horizons,
+    with h steps summed at forecast time. One pickle covers all horizons.
+    """
+    import json, pickle
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    dates, endog, exog = load_data()
+    y = endog.to_numpy(dtype=float)
+    X = exog.to_numpy(dtype=float)
+
+    test_end = len(y)
+    if TEST_END is not None:
+        test_end = int(dates.searchsorted(pd.Timestamp(TEST_END), side="right"))
+
+    model_obj = ProphetModel(dates, REGRESSOR_COLS, growth=growth)
+    model_obj.fit(y[:test_end], X[:test_end])
+
+    out_pkl = MODELS_DIR / "prophet_final.pkl"
+    with open(out_pkl, "wb") as fh:
+        pickle.dump(model_obj, fh)
+
+    meta = {
+        "growth": growth,
+        "regressors": REGRESSOR_COLS,
+        "train_end_date": str(dates[test_end - 1].date()),
+        "horizons": "all (sum h daily forecasts at inference time)",
+    }
+    with open(MODELS_DIR / "prophet_final_meta.json", "w") as fh:
+        json.dump(meta, fh, indent=2)
+    print(f"  [Prophet] saved -> {out_pkl}")
 
 
 if __name__ == "__main__":
