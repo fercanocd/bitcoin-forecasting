@@ -36,10 +36,6 @@ reports/
 *.png
 *.html
 
-# Thesis working directory + plain-text drafts (not versioned here)
-thesis/
-*.txt
-
 # LaTeX (thesis documents — not versioned here)
 *.tex
 *.aux
