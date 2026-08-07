@@ -66,6 +66,7 @@ import time
 PROCESSED_DIR = Path(__file__).resolve().parents[2] / "data" / "processed"
 RESULTS_DIR   = Path(__file__).resolve().parents[2] / "reports" / "predictions"
 METRICS_DIR   = Path(__file__).resolve().parents[2] / "reports" / "metrics"
+MODELS_DIR    = Path(__file__).resolve().parents[2] / "models" / "saved"
 
 ENDOG_COL = "log_return"
 EXOG_COLS = ["log_volume_ratio", "sp500_log_return", "gold_log_return",
@@ -413,6 +414,8 @@ def run_all(horizons=None, trend="c", select=True, refit="step",
     if max_test_days is None:                    # skip on smoke runs (partial test)
         _save_test_report(dates, y, X_full, test_start, test_end,
                           order, trend, keep_idx, train_window)
+        save_final_model(dates, y, X_full, test_end,
+                         order, trend, keep_idx, train_window)
     return results
 
 
@@ -515,6 +518,33 @@ def run_cv(horizons=None, trend="c", select=True, refit="step",
         pd.DataFrame(spec_rows).to_csv(METRICS_DIR / "sarimax_spec_cv.csv", index=False)
         print(f"  CV structure -> {METRICS_DIR / 'sarimax_spec_cv.csv'}")
     return agg, per_fold
+
+
+def save_final_model(dates, y, X_full, test_end, order, trend,
+                     keep_idx, train_window):
+    """Fit SARIMAX on the full available history and pickle the result.
+
+    This is the model you would use to predict tomorrow: fitted on every
+    observation from TRAIN_START through the last test date, with the same
+    structure (order, kept regressors) selected during Round 1."""
+    import pickle, json
+    kept_cols = [EXOG_COLS[i] for i in keep_idx] if keep_idx else []
+    lo  = 0 if train_window is None else max(0, test_end - train_window)
+    Xk  = X_full[lo:test_end][:, keep_idx] if keep_idx else None
+    res = SARIMAX(y[lo:test_end], exog=Xk, order=order, trend=trend,
+                  enforce_stationarity=False,
+                  enforce_invertibility=False).fit(disp=False)
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    with open(MODELS_DIR / "sarimax_final.pkl", "wb") as f:
+        pickle.dump(res, f)
+    meta = {"order": list(order), "trend": trend,
+            "regressors": kept_cols,
+            "train_start": str(dates[lo].date()),
+            "train_end":   str(dates[test_end - 1].date()),
+            "n_obs": test_end - lo}
+    (MODELS_DIR / "sarimax_final_meta.json").write_text(
+        __import__("json").dumps(meta, indent=2), encoding="utf-8")
+    print(f"  Final model -> {MODELS_DIR / 'sarimax_final.pkl'}")
 
 
 def report_only(trend="c", select=True, train_window=TRAIN_WINDOW):

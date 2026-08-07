@@ -54,6 +54,7 @@ import time
 PROCESSED_DIR = Path(__file__).resolve().parents[2] / "data" / "processed"
 RESULTS_DIR   = Path(__file__).resolve().parents[2] / "reports" / "predictions"
 METRICS_DIR   = Path(__file__).resolve().parents[2] / "reports" / "metrics"
+MODELS_DIR    = Path(__file__).resolve().parents[2] / "models" / "saved"
 
 TARGET_TEMPLATE = "target_log_return_{h}d"
 
@@ -338,6 +339,27 @@ def _feature_names() -> list[str]:
     return [c for c in cols if not c.startswith("target_") and c != "Date"]
 
 
+def save_final_model(horizon: int, hparams: dict | None = None):
+    """Fit XGBoost on the full available history and save in native JSON format.
+
+    Uses the same recipe as the walk-forward (best CV hparams, early stopping
+    on a chronological tail). The saved model can be loaded with
+    xgb.XGBRegressor() and model.load_model('xgboost_{h}d.json')."""
+    hparams = hparams or _load_best_hparams(horizon)
+    params  = {**BASE_PARAMS, **hparams, "importance_type": "gain"}
+    dates, y, X = load_data(horizon)
+    test_end = len(y)
+    if TEST_END is not None:
+        test_end = min(test_end,
+                       int(dates.searchsorted(pd.Timestamp(TEST_END), side="right")))
+    train_end = test_end - horizon          # purge h rows
+    model = _fit_es(X[:train_end], y[:train_end], params)
+    MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    out = MODELS_DIR / f"xgboost_{horizon}d.json"
+    model.save_model(str(out))
+    print(f"  Final model h={horizon}d -> {out}")
+
+
 def save_feature_importance(horizons=None, hparams_by_h=None):
     """Persist XGBoost gain importance at the two protocol reference fits per
     horizon -- development (fit on 2018-2023, purged) and test_final (fit on the
@@ -396,6 +418,9 @@ def run_all(horizons=None, hparams_by_h=None, refit="monthly",
 
     if max_test_days is None:                    # skip on smoke runs (heavy extra fits)
         save_feature_importance(horizons, hparams_by_h)
+        for h in horizons:
+            hp = None if hparams_by_h is None else hparams_by_h.get(h)
+            save_final_model(h, hp)
     return results
 
 
